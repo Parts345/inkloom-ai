@@ -1,0 +1,14 @@
+services:
+  inkloom:
+    build: .
+    ports:
+      - "7860:7860"
+    environment:
+      DEMO_MODE: "true"
+      DATABASE_URL: sqlite:////data/inkloom.db
+      CORS_ORIGINS: http://localhost:5173
+    volumes:
+      - inkloom-data:/data
+
+volumes:
+  inkloom-data:
