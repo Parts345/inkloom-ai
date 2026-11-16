@@ -1,3 +1,27 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@theme {
+  /* Cream surfaces */
+  --color-white: #FFFCF6;
+  --color-slate-50: #F4EDE0;
+  --color-slate-100: #EBE2D0;
+  --color-slate-200: #DDD2BB;
+  --color-slate-300: #C9BCA0;
+  --color-slate-400: #A39A88;
+
+  /* Navy text and dark surfaces */
+  --color-slate-500: #6C7389;
+  --color-slate-600: #4B5572;
+  --color-slate-700: #2F3B5C;
+  --color-slate-800: #1E2B4B;
+  --color-slate-900: #14213D;
+
+  /* Coral accent (replaces teal everywhere) */
+  --color-teal-50: #FFF0ED;
+  --color-teal-100: #FFDDD7;
+  --color-teal-300: #FFA295;
+  --color-teal-500: #FF6B5B;
+  --color-teal-600: #FF6B5B;
+  --color-teal-700: #D6432F;
+  --color-teal-800: #B3321F;
+}
