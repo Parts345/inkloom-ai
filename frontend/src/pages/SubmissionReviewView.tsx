@@ -51,7 +51,7 @@ function FindingCard({ f, onAct, focused, onFocus }: { f: Finding; onAct: (a: 'a
       {f.dispute_reason && <p className="mt-2 text-xs text-slate-600">Dispute reason: {f.dispute_reason}</p>}
       {!done && (<>
         <div className="mt-3 flex flex-wrap gap-2">
-          <button disabled={busy} onClick={() => act('accept')} className="flex items-center gap-1 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"><Check size={14} />Accept Edit</button>
+          <button disabled={busy || !f.suggested.trim()} title={!f.suggested.trim() ? 'No applicable inline text replacement' : undefined} onClick={() => act('accept')} className="flex items-center gap-1 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"><Check size={14} />Accept Edit</button>
           <button disabled={busy} onClick={() => act('reject')} className="flex items-center gap-1 rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium"><X size={14} />Reject</button>
           <button disabled={busy} onClick={() => setDispute(!dispute)} className="flex items-center gap-1 rounded-md border border-amber-400 px-3 py-1.5 text-sm font-medium text-amber-900"><Flag size={14} />Dispute</button>
         </div>

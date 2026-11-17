@@ -4,6 +4,7 @@ export const sevStyle: Record<Severity, string> = {
 export const markStyle: Record<Severity, string> = {
   critical: 'bg-red-100 border-b-2 border-red-500', major: 'bg-amber-100 border-b-2 border-amber-500', minor: 'bg-blue-100 border-b-2 border-blue-500' };
 const statusStyle: Record<Status, string> = {
+  Draft: 'bg-slate-100 text-slate-700',
   'In Review': 'bg-sky-100 text-sky-800', 'Revision Required': 'bg-amber-100 text-amber-900',
   Approved: 'bg-emerald-100 text-emerald-800', Rejected: 'bg-red-100 text-red-800' };
 export const SeverityBadge = ({ s }: { s: Severity }) => <span className={`rounded-full px-2 py-0.5 text-xs font-semibold capitalize ring-1 ${sevStyle[s]}`}>{s}</span>;

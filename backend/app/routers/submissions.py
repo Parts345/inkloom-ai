@@ -13,6 +13,7 @@ from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -186,6 +187,66 @@ def _refresh_verification_index(db: Session, workspace_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- Submissions & Upload
+@router.get("/analytics")
+def workspace_analytics(
+    actor: Actor = Depends(resolve_actor),
+    db: Session = Depends(get_db),
+) -> dict:
+    total_submissions = db.query(func.count(Submission.id)).filter_by(
+        workspace_id=actor.workspace_id
+    ).scalar() or 0
+    approved_submissions = db.query(func.count(Submission.id)).filter_by(
+        workspace_id=actor.workspace_id,
+        status="approved",
+    ).scalar() or 0
+    approval_rate = round(approved_submissions * 100 / total_submissions) if total_submissions else 0
+
+    rule_name = func.coalesce(
+        func.nullif(func.trim(FindingRecord.evidence_title), ""),
+        FindingRecord.category,
+    )
+    top_rules = (
+        db.query(rule_name.label("rule"), func.count(FindingRecord.id).label("count"))
+        .join(Submission, FindingRecord.submission_id == Submission.id)
+        .filter(Submission.workspace_id == actor.workspace_id)
+        .group_by(rule_name)
+        .order_by(func.count(FindingRecord.id).desc(), rule_name.asc())
+        .limit(5)
+        .all()
+    )
+    by_category = (
+        db.query(FindingRecord.category, func.count(FindingRecord.id).label("count"))
+        .join(Submission, FindingRecord.submission_id == Submission.id)
+        .filter(Submission.workspace_id == actor.workspace_id)
+        .group_by(FindingRecord.category)
+        .order_by(func.count(FindingRecord.id).desc(), FindingRecord.category.asc())
+        .all()
+    )
+    disputed_rules = (
+        db.query(rule_name.label("rule"), func.count(FindingRecord.id).label("disputes"))
+        .join(Submission, FindingRecord.submission_id == Submission.id)
+        .filter(
+            Submission.workspace_id == actor.workspace_id,
+            FindingRecord.status == "disputed",
+        )
+        .group_by(rule_name)
+        .order_by(func.count(FindingRecord.id).desc(), rule_name.asc())
+        .all()
+    )
+
+    return {
+        "total_submissions": int(total_submissions),
+        "approval_rate": int(approval_rate),
+        "top_rules": [{"rule": rule, "count": int(count)} for rule, count in top_rules],
+        "by_category": [
+            {"category": category, "count": int(count)} for category, count in by_category
+        ],
+        "disputed_rules": [
+            {"rule": rule, "disputes": int(disputes)} for rule, disputes in disputed_rules
+        ],
+    }
+
+
 @router.post("/submissions", response_model=SubmissionResponse, status_code=201)
 async def create_submission(
     title: str = Form(..., min_length=1, max_length=200),

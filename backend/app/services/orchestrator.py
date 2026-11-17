@@ -18,7 +18,7 @@ from app.services import deterministic, extraction, persistence, verification
 
 log = logging.getLogger(__name__)
 
-VERIFICATION_TIMEOUT_S = 45.0  # Proposal target: analysis under 60 s at p95
+VERIFICATION_TIMEOUT_S = 120.0
 SEVERITY_RANK = {"critical": 3, "major": 2, "minor": 1}
 
 
@@ -147,7 +147,11 @@ def _merge_group(group: List[Finding]) -> Finding:
 def _settle(result: object, run: _Run, stage: str) -> List[Finding]:
     """Return a stage's findings, or an empty list with an audit entry if it failed."""
     if isinstance(result, BaseException):
-        reason = "timeout" if isinstance(result, TimeoutError) else type(result).__name__
+        reason = (
+            f"timeout after {VERIFICATION_TIMEOUT_S}s"
+            if isinstance(result, TimeoutError)
+            else f"{type(result).__name__}: {str(result)[:200]}"
+        )
         log.warning("%s degraded: %s", stage, result, exc_info=result)
         run.log(f"{stage}_degraded", reason)
         return []

@@ -7,6 +7,9 @@ services:
       DEMO_MODE: "true"
       DATABASE_URL: sqlite:////data/inkloom.db
       CORS_ORIGINS: http://localhost:5173
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL:-}
     volumes:
       - inkloom-data:/data
 

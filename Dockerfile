@@ -26,7 +26,8 @@ RUN useradd --create-home --uid 1000 app \
  && chown app:app /data
 
 COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install -r backend/requirements.txt
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
+ && pip install -r backend/requirements.txt
 
 COPY backend/app ./app
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
