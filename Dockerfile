@@ -29,6 +29,11 @@ COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
  && pip install -r backend/requirements.txt
 
+# Bake the embedding model into the image so the first analysis never waits on the Hugging Face Hub.
+RUN mkdir -p /home/app/.cache/huggingface \
+ && HF_HOME=/home/app/.cache/huggingface python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2', device='cpu')" \
+ && chown -R app:app /home/app/.cache
+
 COPY backend/app ./app
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 

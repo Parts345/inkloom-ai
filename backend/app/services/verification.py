@@ -180,7 +180,8 @@ class BrandRAGEngine:
 
             logger.info("Loading SentenceTransformer '%s' on CPU...", self._model_name)
             self._encoder = SentenceTransformer(self._model_name, device="cpu")
-            self._embedding_dim = self._encoder.get_sentence_embedding_dimension()
+            get_dim = getattr(self._encoder, "get_embedding_dimension", None) or self._encoder.get_sentence_embedding_dimension
+            self._embedding_dim = get_dim()
         return self._encoder
 
     @staticmethod
@@ -314,7 +315,13 @@ RULES:
 3. MINIMAL EDITS:
    - `original_span` must be an exact verbatim substring of `content_unit.text`.
    - `suggested_edit` must be a minimal drop-in replacement for `original_span` preserving the author's meaning and voice.
-4. Return ONLY valid JSON matching:
+4. Explanations must be written for a human reviewer. Do not mention "fact entry", "register", "evidence_id" or other internal terms. Say what is wrong and what the approved value is.
+5. suggested_edit must not contain any banned term, and must not repeat the original text unchanged. If the correct action is removal, set suggested_edit to an empty string.
+6. Prefer approved facts over invented wording. For example use "99.95% monthly uptime SLA" rather than "guaranteed" or "100% uptime".
+7. suggested_edit must be plain text that can replace original_span inside a sentence. Do not add markup, URLs, file names, or new factual claims. For an image placeholder, suggest a short plain-text description such as "[Image: NovaTech team photo]". For a superlative or unsupported claim, suggest removing the claim or rewording it without adding a new claim.
+8. Flag exclamation marks in customer-facing copy as tone issues under the brand voice guideline. Do not flag them in headings.
+9. For punctuation issues such as exclamation marks, original_span must include the two or three words before the mark, for example "zero downtime!", and suggested_edit must be the same words without the mark. Never return a bare punctuation mark as original_span or suggested_edit. For passive voice, rewrite the sentence in active voice without dropping the subject. For example, "keeps your data encrypted by us" becomes "we encrypt your data".
+10. Return ONLY valid JSON matching:
    {"findings": [{"category": "...", "fact_status": "...", "severity": "...", "original_span": "...", "evidence_id": null, "evidence_quote": null, "explanation": "...", "suggested_edit": "...", "confidence": 0.0}]}
 """
 
@@ -361,7 +368,7 @@ class LLMProviderClient:
 # Superlatives and guarantees the mock flags when no active fact supports them.
 _UNSUPPORTED_CLAIM_RE = re.compile(
     r"(?<!\w)(?:#1|number one|best[- ]in[- ]class|guaranteed|fastest|unrivaled"
-    r"|\d+(?:\.\d+)?%\s+(?:uptime|availability|accurate))(?!\w)",
+    r"|zero downtime|\d+(?:\.\d+)?%\s+(?:uptime|availability|accurate))(?!\w)",
     re.IGNORECASE,
 )
 
@@ -404,6 +411,13 @@ def _already_flagged(findings: List[Finding], span: str, category: IssueCategory
     return any(f.original_span == span and f.category == category for f in findings)
 
 
+def _terminology_explanation(span: str, ev: EvidenceItem, suggested: str) -> str:
+    text = f"'{span}' conflicts with approved terminology: {ev.quote}"
+    if not suggested:
+        text += " Remove the banned term."
+    return text
+
+
 def _deterministic_mock_analyze(
     unit: ContentUnit, evidence_pool: List[EvidenceItem]
 ) -> List[Finding]:
@@ -420,7 +434,7 @@ def _deterministic_mock_analyze(
         if ev.entry_type == EntryType.BANNED_TERM:
             term = ev.title.strip()
             protected: List[str] = []
-            suggested = ev.preferred_replacement or "[approved term]"
+            suggested = ev.preferred_replacement or ""
         elif (
             ev.entry_type == EntryType.PREFERRED_TERM
             and ev.preferred_replacement
@@ -453,7 +467,7 @@ def _deterministic_mock_analyze(
                 original_span=span,
                 evidence_id=ev.evidence_id,
                 evidence_quote=ev.quote,
-                explanation=f"'{span}' conflicts with [{ev.evidence_id}]: {ev.quote}",
+                explanation=_terminology_explanation(span, ev, suggested),
                 suggested_edit=suggested,
                 confidence=0.98,
             )
@@ -479,8 +493,9 @@ def _deterministic_mock_analyze(
                     evidence_id=ev.evidence_id,
                     evidence_quote=ev.quote,
                     explanation=(
-                        f"'{span}' matches expired fact [{ev.evidence_id}] "
-                        f"(expired {ev.expiry_date})."
+                        f"'{span}' refers to an offer or fact that ended on "
+                        f"{ev.expiry_date.isoformat() if ev.expiry_date else 'an earlier date'}. "
+                        "Confirm the offer is removed or updated."
                     ),
                     suggested_edit="",
                     confidence=0.90,
@@ -505,7 +520,7 @@ def _deterministic_mock_analyze(
                 evidence_id=None,
                 evidence_quote=None,
                 explanation=(
-                    f"Claim '{span}' has no supporting evidence in the approved fact register."
+                    f"'{span}' is not backed by an approved fact. Substantiate it with approved evidence or remove it."
                 ),
                 suggested_edit="",
                 confidence=0.85,
@@ -518,14 +533,61 @@ def _deterministic_mock_analyze(
 # ---- LLM path --------------------------------------------------------------
 
 
+_BLANKED_EDIT_PHRASES = ("guaranteed", "zero downtime", "100% uptime")
+_REMOVE_SUFFIX = " Remove the banned term instead of replacing it."
+_MARKUP_RE = re.compile(r"!?\[[^\]]*\]\([^)]*\)")
+_FILENAME_RE = re.compile(r"\b[\w-]+\.(jpg|jpeg|png|gif|svg|pdf|html?)\b", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _banned_terms(evidence_pool: List[EvidenceItem]) -> List[str]:
+    """Lowercased titles of every banned-term entry in the pool."""
+    return [
+        ev.title.strip().casefold()
+        for ev in evidence_pool
+        if ev.entry_type == EntryType.BANNED_TERM and ev.title.strip()
+    ]
+
+
+def _clean_suggested_edit(f: Finding, banned_terms: List[str]) -> None:
+    """Blank suggestions that change nothing or would reintroduce banned wording."""
+    edit = (f.suggested_edit or "").strip()
+    if not edit or edit == f.original_span.strip():
+        f.suggested_edit = ""
+        return
+
+    if _MARKUP_RE.search(edit) or _FILENAME_RE.search(edit) or _URL_RE.search(edit):
+        f.suggested_edit = ""
+        return
+
+    lowered = edit.casefold()
+    reintroduces_banned = any(
+        re.search(_phrase_pattern(term), lowered, flags=re.IGNORECASE)
+        for term in banned_terms
+    ) or any(
+        phrase in lowered and phrase not in f.original_span.casefold()
+        for phrase in _BLANKED_EDIT_PHRASES
+    )
+
+    if reintroduces_banned:
+        f.suggested_edit = ""
+        f.explanation = f"{f.explanation.rstrip()}{_REMOVE_SUFFIX}"
+        return
+
+    f.suggested_edit = edit
+
+
 def _validate_and_ground(
     raw_findings: List[Finding],
     unit: ContentUnit,
     retrieved_evidence: List[EvidenceItem],
+    banned_terms: Optional[List[str]] = None,
 ) -> List[Finding]:
     evidence_map = {e.evidence_id: e for e in retrieved_evidence}
+    banned = list(banned_terms or []) + _banned_terms(retrieved_evidence)
     validated: List[Finding] = []
     seen = set()
+    claimed_punctuation_positions = set()
 
     for f in raw_findings:
         if not f.original_span.strip():
@@ -536,6 +598,39 @@ def _validate_and_ground(
                 f.original_span = match.group(0)
             else:
                 continue
+
+        if not re.search(r"[A-Za-z0-9]", f.original_span):
+            occurrences = re.finditer(re.escape(f.original_span), unit.text)
+            occurrence = next(
+                (match for match in occurrences if match.start() not in claimed_punctuation_positions),
+                None,
+            )
+            if occurrence is None:
+                continue
+
+            mark = occurrence.group(0)
+            preceding_text = unit.text[:occurrence.start()].rstrip()
+            sentence_start = max(
+                preceding_text.rfind("."),
+                preceding_text.rfind("?"),
+                preceding_text.rfind("!"),
+            ) + 1
+            sentence_text = preceding_text[sentence_start:].strip()
+            sentence_words = sentence_text.split()
+            context_text = (
+                sentence_text if len(sentence_words) <= 3 else " ".join(sentence_words[-2:])
+            )
+            words_match = re.search(r"(?:\S+\s+){0,2}\S*$", context_text)
+            preceding_words = words_match.group(0).strip() if words_match else ""
+            if not preceding_words:
+                continue
+
+            f.original_span = f"{preceding_words}{mark}"
+            if not f.suggested_edit or not re.search(r"[A-Za-z0-9]", f.suggested_edit):
+                f.suggested_edit = preceding_words
+            claimed_punctuation_positions.add(occurrence.start())
+
+        _clean_suggested_edit(f, banned)
 
         if f.evidence_id is not None:
             ev = evidence_map.get(f.evidence_id)
@@ -558,12 +653,40 @@ def _validate_and_ground(
     return validated
 
 
+def _parse_llm_payload(raw: str) -> LLMAnalysisResponse:
+    """Parse a provider's JSON reply, tolerating nulls in optional text fields.
+
+    Raises ValueError (JSONDecodeError and pydantic ValidationError both subclass it)
+    so the caller can retry with the error included in the prompt.
+    """
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("LLM reply must be a JSON object")
+
+    findings = data.get("findings") or []
+    if not isinstance(findings, list):
+        raise ValueError("'findings' must be a list")
+
+    for item in findings:
+        if isinstance(item, dict):
+            if item.get("fact_status") is None:
+                item["fact_status"] = "not_applicable"
+            if item.get("suggested_edit") is None:
+                item["suggested_edit"] = ""
+            if item.get("explanation") is None:
+                item["explanation"] = ""
+    data["findings"] = findings
+    return LLMAnalysisResponse.model_validate(data)
+
+
 def _llm_analyze(
     client: LLMProviderClient,
     unit: ContentUnit,
     retrieved_evidence: List[EvidenceItem],
     max_retries: int,
     temperature: float,
+    banned_terms: Optional[List[str]] = None,
 ) -> List[Finding]:
     base_prompt = json.dumps(
         {
@@ -578,17 +701,9 @@ def _llm_analyze(
     for attempt in range(max_retries + 1):
         try:
             raw = client.generate_json(SYSTEM_PROMPT, prompt, temperature=temperature)
-            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE)
-            data = json.loads(cleaned)
-            for item in data.get("findings", []):
-                if isinstance(item, dict):
-                    if item.get("fact_status") is None:
-                        item["fact_status"] = "not_applicable"
-                    if item.get("suggested_edit") is None:
-                        item["suggested_edit"] = ""
-            parsed = LLMAnalysisResponse.model_validate(data)
-            return _validate_and_ground(parsed.findings, unit, retrieved_evidence)
-        except (json.JSONDecodeError, ValidationError) as err:
+            parsed = _parse_llm_payload(raw)
+            return _validate_and_ground(parsed.findings, unit, retrieved_evidence, banned_terms)
+        except ValueError as err:  # JSON decode and schema errors
             last_err = err
             logger.warning("Retry %d/%d for unit %s: %s", attempt + 1, max_retries, unit.unit_id, err)
             prompt = f"{base_prompt}\n\nINVALID JSON OUTPUT:\n{err}\nReturn ONLY valid schema JSON."
@@ -620,7 +735,9 @@ def analyze_text_unit(
         return _deterministic_mock_analyze(unit, pool)
 
     try:
-        return _llm_analyze(client, unit, retrieved_evidence, max_retries, temperature)
+        llm_findings = _llm_analyze(
+            client, unit, retrieved_evidence, max_retries, temperature, _banned_terms(pool)
+        )
     except Exception as err:  # auth errors, network errors, schema failures, missing SDK
         logger.exception(
             "LLM verification failed for unit %s (%s); using deterministic fallback",
@@ -628,6 +745,20 @@ def analyze_text_unit(
             err,
         )
         return _deterministic_mock_analyze(unit, pool)
+
+    # Keep exact-match checks that the LLM missed, but avoid duplicating a
+    # deterministic span already covered by a broader LLM finding.
+    mock_findings = _deterministic_mock_analyze(unit, pool)
+    extra = [
+        mock_finding
+        for mock_finding in mock_findings
+        if not any(
+            mock_finding.original_span.lower() in llm_finding.original_span.lower()
+            for llm_finding in llm_findings
+        )
+    ]
+    return llm_findings + extra
+
 
 
 # ---------------------------------------------------------------------------

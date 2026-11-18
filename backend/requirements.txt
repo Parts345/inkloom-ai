@@ -8,3 +8,8 @@ python-docx
 opencv-python-headless
 sentence-transformers
 faiss-cpu
+python-dotenv>=1.0
+openai>=1.40
+Pillow>=10.0
+numpy>=1.26
+pytesseract>=0.3

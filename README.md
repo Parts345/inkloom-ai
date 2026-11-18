@@ -30,6 +30,17 @@ t2:
 
 cd ~/COMP/inkloom-ai-main/backend
 source .venv/bin/activate
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8000 2>&1 | tee server.log
 
 podman-compose up -d --build
+## Configure the LLM verifier (optional)
+
+The app works without an LLM key using deterministic checks. To enable LLM verification:
+
+    cp .env.example .env     # then edit .env and set LLM_API_KEY
+
+`.env` is git-ignored and excluded from the Docker image. Never paste a key into chat, issues, or commits. Rotate any key that was shared.
+
+After changing `.env`, recreate the container so it picks up the new value:
+
+    docker compose down && docker compose up -d --build

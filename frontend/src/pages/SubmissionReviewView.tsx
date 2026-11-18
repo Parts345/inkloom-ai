@@ -47,6 +47,7 @@ function FindingCard({ f, onAct, focused, onFocus }: { f: Finding; onAct: (a: 'a
         <p className="mb-1 font-sans text-xs font-semibold text-slate-500">Suggested minimal edit</p>
         <p className="bg-red-50 px-1 text-red-800 line-through">{f.original}</p>
         <p className="mt-1 bg-emerald-50 px-1 text-emerald-800">{f.suggested}</p>
+        {!f.suggested && <p className="mt-1 italic text-slate-500">Remove this text</p>}
       </div>
       {f.dispute_reason && <p className="mt-2 text-xs text-slate-600">Dispute reason: {f.dispute_reason}</p>}
       {!done && (<>
