@@ -3,12 +3,24 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
+
+# Database and logs
 *.db
+*.sqlite
+*.sqlite3
+*.log
 
 # Node / frontend
 node_modules/
 frontend/dist/
 
-# Env and OS
+# Env and secrets: commit the template only
 .env
+.env.*
+!.env.example
+
+# Editors and OS
+.vscode/
+.idea/
 .DS_Store

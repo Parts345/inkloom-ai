@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Tuple
@@ -110,36 +111,63 @@ async def analyse_submission(
 
 
 def merge_findings(findings: Iterable[Finding]) -> List[Finding]:
-    """Collapse findings flagging the same span, category and unit.
+    """Collapse duplicate findings.
 
-    Keeps the most severe, most confident finding; combines explanations; retains the
-    first available evidence and suggested edit.
+    Pass 1: same unit, category and span -> one finding.
+    Pass 2: same unit and span across categories (for example a fact and a
+    terminology finding both flagging "100% uptime") -> one finding, the most
+    severe and most confident. Different spans are never merged, even if they overlap.
     """
     groups: dict[Tuple[str, str, str], List[Finding]] = {}
     for f in findings:
         key = (f.unit_id, f.category, _normalise(f.original_span))
         groups.setdefault(key, []).append(f)
+    per_category = [_merge_group(group) for group in groups.values()]
 
-    merged = [_merge_group(group) for group in groups.values()]
+    span_groups: dict[Tuple[str, str], List[Finding]] = {}
+    for f in per_category:
+        span_groups.setdefault((f.unit_id, _normalise(f.original_span)), []).append(f)
+    merged = [_merge_group(group) for group in span_groups.values()]
+
     merged.sort(key=lambda f: (-SEVERITY_RANK[f.severity], f.unit_id, f.finding_id))
     return merged
+
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _combine_explanations(texts: Iterable[str]) -> str:
+    """Join explanations, dropping any sentence already contained in another sentence."""
+    sentences: List[str] = []
+    for text in texts:
+        for sentence in _SENTENCE_SPLIT.split((text or "").strip()):
+            sentence = sentence.strip()
+            if sentence and sentence not in sentences:
+                sentences.append(sentence)
+    kept: List[str] = []
+    for sentence in sentences:
+        lowered = sentence.casefold()
+        if any(lowered != other.casefold() and lowered in other.casefold() for other in sentences):
+            continue
+        kept.append(sentence)
+    return " ".join(kept)
 
 
 def _merge_group(group: List[Finding]) -> Finding:
     best = max(group, key=lambda f: (SEVERITY_RANK[f.severity], f.confidence))
 
-    explanations: List[str] = []
-    for f in group:
-        if f.explanation and f.explanation not in explanations:
-            explanations.append(f.explanation)
+    def usable(edit: Optional[str]) -> bool:
+        # A suggestion that equals the flagged span changes nothing, so never show it.
+        return bool(edit) and edit.strip() != best.original_span.strip()
 
     return best.model_copy(
         update={
             "confidence": max(f.confidence for f in group),
-            "explanation": " ".join(explanations),
+            "explanation": _combine_explanations(f.explanation for f in group),
             "evidence": best.evidence or next((f.evidence for f in group if f.evidence), None),
-            "suggested_edit": best.suggested_edit
-            or next((f.suggested_edit for f in group if f.suggested_edit), None),
+            "suggested_edit": next(
+                (f.suggested_edit for f in [best, *group] if usable(f.suggested_edit)), None
+            ),
         }
     )
 
@@ -155,7 +183,9 @@ def _settle(result: object, run: _Run, stage: str) -> List[Finding]:
         log.warning("%s degraded: %s", stage, result, exc_info=result)
         run.log(f"{stage}_degraded", reason)
         return []
-    return list(result)  # type: ignore[arg-type]
+    findings = list(result)  # type: ignore[arg-type]
+    run.log(f"{stage}_completed", f"findings={len(findings)}")
+    return findings
 
 
 def _initial_status(findings: List[Finding]) -> str:
