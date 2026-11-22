@@ -54,7 +54,7 @@ export default function App() {
         {tab === 'review' && <SubmissionReviewView role={role} submissions={subs} activeId={activeId} onSelect={setActiveId} onChanged={() => refresh()} onNew={() => setTab('new')} />}
         {tab === 'new' && <NewSubmissionView onCreated={async id => { await refresh(id); setTab('review'); }} />}
         {tab === 'kb' && <BrandKnowledgeView role={role} />}
-        {tab === 'analytics' && <GovernanceAnalyticsView />}
+        {tab === 'analytics' && <GovernanceAnalyticsView role={role} />}
       </main>
     </div>
   );
