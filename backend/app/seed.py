@@ -1,15 +1,25 @@
-"""Owner: Soham. Seeds the NovaTech Cloud demo workspace, knowledge base, and sample submissions idempotently."""
+"""Owner: Soham. Seeds NovaTech Cloud workspace, rules, 2 PNG visual assets, and sample disputes."""
 from __future__ import annotations
 
+import struct
+import zlib
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.models import FindingRecord, KnowledgeEntry, Submission, Workspace, utcnow
+from app.models import (
+    FindingRecord,
+    KnowledgeEntry,
+    RuleRefinementProposal,
+    Submission,
+    Workspace,
+    utcnow,
+)
 from app.routers.demo import DEMO_WORKSPACE_ID
-from app.services.persistence import add_audit
+from app.services.persistence import add_audit, get_assets_dir
 
 WORKSPACE_ID = DEMO_WORKSPACE_ID  # "ws_novatech_cloud"
 WORKSPACE_NAME = "NovaTech Cloud"
@@ -18,6 +28,27 @@ PALETTE = ["#0F172A", "#0284C7", "#38BDF8"]
 _TODAY = date.today()
 _FUTURE = _TODAY + timedelta(days=365)
 _EXPIRED = _TODAY - timedelta(days=45)
+
+
+def _write_solid_png(path: Path, width: int, height: int, rgb: tuple[int, int, int]) -> None:
+    """Write a valid PNG image using Python's built-in zlib + struct (zero external deps)."""
+    if path.exists():
+        return
+    r, g, b = rgb
+    raw_rows = b"".join(b"\x00" + bytes([r, g, b]) * width for _ in range(height))
+
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return struct.pack("!I", len(payload)) + tag + payload + struct.pack("!I", crc)
+
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(raw_rows))
+        + _chunk(b"IEND", b"")
+    )
+    path.write_bytes(png)
 
 
 def _k(id_, type_, category, title, rule, severity, owner, source, expiry: Optional[date] = None):
@@ -156,8 +187,26 @@ APPROVED_ORIGINAL = (
 )
 APPROVED_CURRENT = APPROVED_ORIGINAL.replace("Our users", "Our customers")
 
+DISPUTED_SUB_ID = "sub-demo-govcloud"
+DISPUTED_TEXT = (
+    "NovaTech GovCloud complies with FedRAMP High requirements using military-grade encryption "
+    "as required in the federal RFP specification."
+)
 
-def _finding(sub_id, unit_id, category, severity, span, explanation, kb_id, edit, conf, status="open"):
+
+def _finding(
+    sub_id,
+    unit_id,
+    category,
+    severity,
+    span,
+    explanation,
+    kb_id,
+    edit,
+    conf,
+    status="open",
+    dispute_reason=None,
+):
     kb = KB[kb_id]
     return FindingRecord(
         submission_id=sub_id,
@@ -172,7 +221,52 @@ def _finding(sub_id, unit_id, category, severity, span, explanation, kb_id, edit
         suggested_edit=edit,
         confidence=conf,
         status=status,
+        dispute_reason=dispute_reason,
     )
+
+
+def _seed_assets(db: Session) -> None:
+    assets_dir = get_assets_dir()
+    logo_path = assets_dir / "asset-novatech-logo.png"
+    banner_path = assets_dir / "asset-novatech-banner.png"
+    _write_solid_png(logo_path, 240, 80, (15, 23, 42))      # #0F172A Slate Navy
+    _write_solid_png(banner_path, 600, 160, (2, 132, 199))  # #0284C7 Sky Blue
+
+    seeded_assets = [
+        dict(
+            id="asset-novatech-logo",
+            title="NovaTech Cloud Primary Wordmark",
+            asset_type="logo",
+            usage_rules="Use on dark (#0F172A) or white backgrounds with at least 24px clear space. Never stretch, recolor, or drop-shadow.",
+            image_path=str(logo_path),
+        ),
+        dict(
+            id="asset-novatech-banner",
+            title="NovaTech Cloud Hero Banner Template",
+            asset_type="banner",
+            usage_rules="Approved social and blog header banner (#0284C7). Headline text must maintain >= 4.5:1 WCAG AA contrast.",
+            image_path=str(banner_path),
+        ),
+    ]
+    for item in seeded_assets:
+        if db.get(KnowledgeEntry, item["id"]) is None:
+            db.add(
+                KnowledgeEntry(
+                    id=item["id"],
+                    workspace_id=WORKSPACE_ID,
+                    entry_type="asset",
+                    category="visual",
+                    title=item["title"],
+                    rule_text=item["usage_rules"],
+                    severity="major",
+                    owner="Design Team",
+                    source_doc="NovaTech Visual Identity v5",
+                    version=1,
+                    asset_type=item["asset_type"],
+                    image_path=item["image_path"],
+                    usage_rules=item["usage_rules"],
+                )
+            )
 
 
 def _seed_review_draft(db: Session) -> None:
@@ -214,7 +308,9 @@ def _seed_review_draft(db: Session) -> None:
             _finding(
                 DRAFT_ID, "u2", "terminology", "major", "military-grade encryption",
                 "Banned marketing term with no standard meaning.",
-                "kb-t05", "industry-standard encryption", 0.90,
+                "kb-t05", "AES-256 encryption", 0.90,
+                status="disputed",
+                dispute_reason="Security blog specifically contrasts marketing buzzwords against AES-256-GCM.",
             ),
             _finding(
                 DRAFT_ID, "u3", "fact", "major", "3 months free on the Business tier",
@@ -236,6 +332,11 @@ def _seed_review_draft(db: Session) -> None:
     for offset, action, details in [
         (12, "submission_created", "Title 'NovaTech Cloud 3.0 launch email' (text), 3 content units"),
         (11, "analysis_completed", "7 findings (2 critical)"),
+        (
+            5,
+            "finding_disputed",
+            "Finding #4 (major) [rule=kb-t05] disputed: Security blog specifically contrasts marketing buzzwords against AES-256-GCM.",
+        ),
     ]:
         add_audit(
             db,
@@ -245,6 +346,83 @@ def _seed_review_draft(db: Session) -> None:
             action,
             details,
             timestamp=utcnow() - timedelta(minutes=offset),
+        )
+
+
+def _seed_disputed_submission(db: Session) -> None:
+    if db.get(Submission, DISPUTED_SUB_ID) is not None:
+        return
+    t0 = utcnow() - timedelta(hours=5)
+    db.add(
+        Submission(
+            id=DISPUTED_SUB_ID,
+            workspace_id=WORKSPACE_ID,
+            title="Public Sector RFP Security Addendum",
+            source_format="text",
+            original_content=DISPUTED_TEXT,
+            current_content=DISPUTED_TEXT,
+            version=1,
+            status="in_review",
+            created_by="Creator",
+            created_at=t0,
+        )
+    )
+    db.flush()
+    db.add(
+        _finding(
+            DISPUTED_SUB_ID,
+            "u1",
+            "terminology",
+            "major",
+            "military-grade encryption",
+            "Banned marketing term with no standard meaning.",
+            "kb-t05",
+            "FIPS 140-3 validated encryption",
+            0.92,
+            status="disputed",
+            dispute_reason="Verbatim quote from the customer's federal RFP requirement.",
+        )
+    )
+    add_audit(
+        db,
+        DISPUTED_SUB_ID,
+        "creator",
+        "Creator",
+        "submission_created",
+        "Title 'Public Sector RFP Security Addendum' (text), 1 content unit",
+        timestamp=t0,
+    )
+    add_audit(
+        db,
+        DISPUTED_SUB_ID,
+        "creator",
+        "Creator",
+        "finding_disputed",
+        "Finding [rule=kb-t05] disputed: Verbatim quote from the customer's federal RFP requirement.",
+        timestamp=t0 + timedelta(minutes=10),
+    )
+
+    existing_prop = (
+        db.query(RuleRefinementProposal)
+        .filter_by(workspace_id=WORKSPACE_ID, rule_id="kb-t05", status="pending")
+        .first()
+    )
+    if existing_prop is None:
+        db.add(
+            RuleRefinementProposal(
+                workspace_id=WORKSPACE_ID,
+                rule_id="kb-t05",
+                dispute_count=2,
+                cluster_summary=(
+                    "2 creator disputes indicate 'military-grade encryption' is triggered when quoting "
+                    "external federal RFP documents or explicitly contrasting buzzwords with AES-256/FIPS 140-3."
+                ),
+                proposed_rule_text=(
+                    "Avoid 'military-grade encryption' in original marketing copy; specify AES-256-GCM or "
+                    "FIPS 140-3 instead. Exception: verbatim quotes from external RFPs or explicit educational comparisons."
+                ),
+                status="pending",
+            )
         )
 
 
@@ -304,7 +482,9 @@ def _seed(db: Session) -> None:
         if db.get(KnowledgeEntry, row["id"]) is None:
             db.add(KnowledgeEntry(workspace_id=WORKSPACE_ID, version=1, **row))
     db.flush()
+    _seed_assets(db)
     _seed_review_draft(db)
+    _seed_disputed_submission(db)
     _seed_approved_draft(db)
 
 
