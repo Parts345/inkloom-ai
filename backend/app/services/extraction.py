@@ -1,15 +1,13 @@
-
 """
-Owner: Riyesh
-Inkloom AI (Team Caraxes) - document and image extraction service.
+Inkloom AI - Document and Image Extraction Service.
 
 Supported inputs:
     - Pasted text
-    - PDF documents
+    - PDF documents (digital, scanned and hybrid)
     - DOCX documents
     - PNG, JPG, JPEG, TIFF, BMP, WEBP and GIF images
 
-Project contract:
+Main project contract:
     extract_units(
         *,
         text: Optional[str],
@@ -17,18 +15,16 @@ Project contract:
         file_bytes: Optional[bytes]
     ) -> List[ContentUnit]
 
-The output uses the existing ContentUnit and UnitMetadata models
-from app.schemas. No changes to schemas.py or orchestrator.py are required.
+OCR:
+    1. RapidOCR (preferred)
+    2. Tesseract (fallback)
 
-Optional OCR:
-    - pytesseract Python package
-    - Tesseract OCR system executable
-    - Pillow
-
-Important:
-    Raw image bytes are not stored in ContentUnit because the existing
-    schema has no binary-data field. Image units contain a description,
-    dimensions and available alt text instead.
+PDF extraction:
+    - Processes each page independently.
+    - Detects pages with little or no selectable text.
+    - Renders scanned pages at high DPI.
+    - Extracts OCR text in reading order.
+    - Supports mixed digital and scanned pages.
 """
 
 from __future__ import annotations
@@ -41,7 +37,8 @@ import zipfile
 
 from collections import Counter
 from pathlib import Path
-from typing import Any, List, Optional
+from threading import Lock
+from typing import Any, List, Optional, Tuple
 from uuid import uuid4
 
 from app.schemas import ContentUnit
@@ -50,9 +47,9 @@ from app.schemas import ContentUnit
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Optional dependencies
-# ---------------------------------------------------------------------------
+# ============================================================
+# OPTIONAL DEPENDENCIES
+# ============================================================
 
 try:
     import pymupdf as fitz
@@ -87,13 +84,28 @@ except ImportError:
     pytesseract = None
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except ImportError:
+    RapidOCR = None
+
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 OCR_LANG = os.getenv("OCR_LANG", "eng")
-OCR_DPI = int(os.getenv("OCR_DPI", "300"))
 
+# Resolution used when rendering scanned PDF pages.
+OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+
+# Pages with fewer characters are considered scanned candidates.
 MIN_TEXT_CHARS_PER_PAGE = int(
     os.getenv("MIN_TEXT_CHARS_PER_PAGE", "25")
 )
@@ -120,29 +132,26 @@ IMAGE_EXTENSIONS = {
 }
 
 
-if (
-    os.getenv("TESSERACT_CMD")
-    and pytesseract is not None
-):
+if os.getenv("TESSERACT_CMD") and pytesseract is not None:
     pytesseract.pytesseract.tesseract_cmd = os.environ[
         "TESSERACT_CMD"
     ]
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
+# ============================================================
+# EXCEPTIONS
+# ============================================================
 
 class UnsupportedFormatError(ValueError):
     """Raised when an uploaded file cannot be processed."""
 
 
-# ---------------------------------------------------------------------------
-# Unit creation
-# ---------------------------------------------------------------------------
+# ============================================================
+# CONTENT UNIT CREATION
+# ============================================================
 
 def _new_unit_id() -> str:
-    """Generate a unique ID for each extracted content unit."""
+    """Generate a unique ID for every content unit."""
     return f"u_{uuid4().hex}"
 
 
@@ -150,6 +159,7 @@ def _create_text_unit(
     content: str,
     page: Optional[int] = None,
     heading_level: Optional[int] = None,
+    extraction_method: Optional[str] = None,
 ) -> ContentUnit:
     """Create a text ContentUnit using the existing project schema."""
 
@@ -160,6 +170,9 @@ def _create_text_unit(
 
     if heading_level is not None:
         metadata["heading_level"] = heading_level
+
+    if extraction_method is not None:
+        metadata["extraction_method"] = extraction_method
 
     return ContentUnit(
         unit_id=_new_unit_id(),
@@ -176,7 +189,7 @@ def _create_image_unit(
     height: Optional[int] = None,
     alt_text: Optional[str] = None,
 ) -> ContentUnit:
-    """Create an image ContentUnit using the existing project schema."""
+    """Create an image ContentUnit."""
 
     metadata = {}
 
@@ -200,12 +213,12 @@ def _create_image_unit(
     )
 
 
-# ---------------------------------------------------------------------------
-# General helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
 def _clean(text: str) -> str:
-    """Clean unnecessary spaces and null characters."""
+    """Remove unnecessary spaces and null characters."""
 
     text = text.replace("\u00a0", " ")
     text = text.replace("\x00", "")
@@ -216,7 +229,7 @@ def _clean(text: str) -> str:
 
 
 def _split_paragraphs(text: str) -> List[str]:
-    """Split pasted text into separate paragraphs."""
+    """Split text into separate paragraphs."""
 
     return [
         paragraph.strip()
@@ -234,9 +247,9 @@ def _require(module: Any, name: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# File type detection
-# ---------------------------------------------------------------------------
+# ============================================================
+# FILE TYPE DETECTION
+# ============================================================
 
 def _detect_type(
     file_bytes: bytes,
@@ -292,91 +305,296 @@ def _detect_type(
     )
 
 
-# ---------------------------------------------------------------------------
-# OCR helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+# OCR ENGINE MANAGEMENT
+# ============================================================
 
-_ocr_checked: Optional[bool] = None
+_rapidocr_engine: Any = None
+_rapidocr_checked = False
+_rapidocr_lock = Lock()
+
+_tesseract_checked: Optional[bool] = None
 
 
-def _ocr_available() -> bool:
-    """Check whether both pytesseract and Tesseract are available."""
+def _get_rapidocr_engine() -> Any:
+    """Initialize RapidOCR once, when it is first needed."""
 
-    global _ocr_checked
+    global _rapidocr_engine, _rapidocr_checked
 
-    if _ocr_checked is not None:
-        return _ocr_checked
+    if _rapidocr_checked:
+        return _rapidocr_engine
+
+    with _rapidocr_lock:
+
+        if _rapidocr_checked:
+            return _rapidocr_engine
+
+        _rapidocr_checked = True
+
+        if RapidOCR is None:
+            return None
+
+        try:
+            _rapidocr_engine = RapidOCR()
+
+            logger.info(
+                "RapidOCR engine initialized successfully."
+            )
+
+        except Exception as exc:
+            _rapidocr_engine = None
+
+            logger.warning(
+                "RapidOCR initialization failed: %s",
+                exc,
+            )
+
+    return _rapidocr_engine
+
+
+def _tesseract_available() -> bool:
+    """Check whether Tesseract and its executable are available."""
+
+    global _tesseract_checked
+
+    if _tesseract_checked is not None:
+        return _tesseract_checked
 
     if pytesseract is None or Image is None:
-        _ocr_checked = False
+        _tesseract_checked = False
         return False
 
     try:
         pytesseract.get_tesseract_version()
-        _ocr_checked = True
+
+        _tesseract_checked = True
 
     except Exception as exc:
         logger.warning(
             "Tesseract OCR is unavailable: %s",
             exc,
         )
-        _ocr_checked = False
 
-    return _ocr_checked
+        _tesseract_checked = False
+
+    return _tesseract_checked
 
 
-def _ocr_image(
-    image: Any,
-) -> str:
-    """Extract text from a PIL image using Tesseract."""
+def _ocr_available() -> bool:
+    """Check whether at least one OCR engine is available."""
 
-    if not _ocr_available():
+    if Image is None:
+        return False
+
+    if _get_rapidocr_engine() is not None:
+        return True
+
+    return _tesseract_available()
+
+
+# ============================================================
+# RAPIDOCR
+# ============================================================
+
+def _rapidocr_text(image: Any) -> str:
+    """
+    Extract text using RapidOCR.
+
+    Results are sorted from top to bottom and left to right
+    to preserve the visual reading order.
+    """
+
+    engine = _get_rapidocr_engine()
+
+    if engine is None or np is None:
+        return ""
+
+    try:
+        rgb_image = image.convert("RGB")
+        image_array = np.asarray(rgb_image)
+
+        result = engine(image_array)
+
+        # rapidocr-onnxruntime returns:
+        # (detections, elapsed_time)
+        detections = (
+            result[0]
+            if isinstance(result, tuple)
+            else result
+        )
+
+        if not detections:
+            return ""
+
+        ordered: List[Tuple[float, float, str]] = []
+
+        for detection in detections:
+
+            if not detection or len(detection) < 2:
+                continue
+
+            box = detection[0]
+
+            recognized_text = _clean(
+                str(detection[1] or "")
+            )
+
+            if not recognized_text:
+                continue
+
+            try:
+                points = np.asarray(
+                    box,
+                    dtype=float
+                ).reshape(-1, 2)
+
+                top = float(points[:, 1].min())
+                left = float(points[:, 0].min())
+
+            except Exception:
+                top = 0.0
+                left = 0.0
+
+            ordered.append(
+                (top, left, recognized_text)
+            )
+
+        ordered.sort(
+            key=lambda item: (item[0], item[1])
+        )
+
+        return _clean(
+            "\n".join(item[2] for item in ordered)
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "RapidOCR failed; trying Tesseract fallback: %s",
+            exc,
+        )
+
+        return ""
+
+
+# ============================================================
+# TESSERACT FALLBACK
+# ============================================================
+
+def _tesseract_text(image: Any) -> str:
+    """Extract text using Tesseract in visual reading order."""
+
+    if not _tesseract_available():
         return ""
 
     try:
         data = pytesseract.image_to_data(
-            image,
+            image.convert("RGB"),
             lang=OCR_LANG,
             output_type=pytesseract.Output.DICT,
         )
 
         lines = {}
 
-        for index, word in enumerate(data["text"]):
+        for index, raw_word in enumerate(
+            data.get("text", [])
+        ):
 
-            word = word.strip()
+            word = _clean(str(raw_word or ""))
 
             if not word:
                 continue
 
             key = (
-                data["block_num"][index],
-                data["par_num"][index],
-                data["line_num"][index],
+                int(data["block_num"][index]),
+                int(data["par_num"][index]),
+                int(data["line_num"][index]),
             )
 
-            lines.setdefault(key, []).append(word)
+            top = int(data["top"][index])
+            left = int(data["left"][index])
 
-        extracted_text = "\n".join(
-            " ".join(words)
-            for _, words in sorted(lines.items())
+            lines.setdefault(key, []).append(
+                (top, left, word)
+            )
+
+        ordered_lines = []
+
+        for words in lines.values():
+
+            words.sort(
+                key=lambda item: item[1]
+            )
+
+            ordered_lines.append(
+                (
+                    min(item[0] for item in words),
+                    min(item[1] for item in words),
+                    " ".join(item[2] for item in words),
+                )
+            )
+
+        ordered_lines.sort(
+            key=lambda item: (item[0], item[1])
         )
 
-        return _clean(extracted_text)
+        return _clean(
+            "\n".join(item[2] for item in ordered_lines)
+        )
 
     except Exception as exc:
-        logger.warning("OCR failed: %s", exc)
+
+        logger.warning(
+            "Tesseract OCR failed: %s",
+            exc,
+        )
+
         return ""
 
 
-# ---------------------------------------------------------------------------
-# PDF extraction
-# ---------------------------------------------------------------------------
+# ============================================================
+# OCR ROUTER
+# ============================================================
 
-def _extract_pdf(
-    file_bytes: bytes,
-) -> List[ContentUnit]:
-    """Extract PDF text, headings, images and scanned-page OCR."""
+def _ocr_image(image: Any) -> str:
+    """
+    Use RapidOCR first.
+
+    If RapidOCR is unavailable or fails to return text,
+    try Tesseract as a fallback.
+    """
+
+    rapid_text = _rapidocr_text(image)
+
+    if rapid_text:
+        return rapid_text
+
+    fallback_text = _tesseract_text(image)
+
+    if fallback_text:
+        return fallback_text
+
+    return ""
+
+
+# ============================================================
+# PDF EXTRACTION
+# ============================================================
+
+def _extract_pdf(file_bytes: bytes) -> List[ContentUnit]:
+    """
+    Extract PDF content page by page.
+
+    Digital pages:
+        Extract selectable text directly using PyMuPDF.
+
+    Scanned pages:
+        Render the page as an image and extract text using OCR.
+
+    Hybrid PDFs:
+        Each page is processed independently, allowing digital
+        and scanned pages in the same document.
+    """
 
     _require(fitz, "pymupdf")
 
@@ -405,7 +623,13 @@ def _extract_pdf(
                 "The PDF document contains no pages."
             )
 
+        page_limit = min(
+            document.page_count,
+            MAX_PAGES,
+        )
+
         if document.page_count > MAX_PAGES:
+
             logger.warning(
                 "PDF has %s pages. Only the first %s will be processed.",
                 document.page_count,
@@ -415,24 +639,39 @@ def _extract_pdf(
         page_records = []
         font_sizes = Counter()
 
-        # First pass: extract text and collect font sizes.
-        for page_index in range(
-            min(document.page_count, MAX_PAGES)
-        ):
+        # ----------------------------------------------------
+        # FIRST PASS: INSPECT EACH PDF PAGE
+        # ----------------------------------------------------
+
+        for page_index in range(page_limit):
 
             page = document[page_index]
-
             page_number = page_index + 1
 
             try:
-                blocks = page.get_text("dict").get(
-                    "blocks",
-                    [],
-                )
+                selectable_text = page.get_text(
+                    "text"
+                ).strip()
 
             except Exception as exc:
+
                 logger.warning(
-                    "Could not extract text from PDF page %s: %s",
+                    "Could not read selectable text on PDF page %s: %s",
+                    page_number,
+                    exc,
+                )
+
+                selectable_text = ""
+
+            try:
+                blocks = page.get_text(
+                    "dict"
+                ).get("blocks", [])
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Could not inspect text layout on PDF page %s: %s",
                     page_number,
                     exc,
                 )
@@ -472,35 +711,51 @@ def _extract_pdf(
 
                     line_size = max(sizes)
 
-                    font_sizes[round(line_size, 1)] += len(
-                        line_text
-                    )
+                    font_sizes[
+                        round(line_size, 1)
+                    ] += len(line_text)
 
-                    page_lines.append(
-                        {
-                            "text": line_text,
-                            "size": round(line_size, 1),
-                        }
-                    )
+                    page_lines.append({
+                        "text": line_text,
+                        "size": round(line_size, 1),
+                    })
 
                     page_text_parts.append(line_text)
 
-            page_text = "\n".join(page_text_parts)
+            try:
+                has_raster_images = bool(
+                    page.get_images(full=True)
+                )
 
-            page_records.append(
-                {
-                    "page": page_number,
-                    "lines": page_lines,
-                    "text": page_text,
-                    "page_object": page,
-                }
+            except Exception:
+                has_raster_images = False
+
+            # A page with very little selectable text is
+            # considered a scanned-page candidate.
+            is_scanned = (
+                len(selectable_text)
+                < MIN_TEXT_CHARS_PER_PAGE
             )
 
-        # Determine the most common font size as body text size.
-        body_size = None
+            page_records.append({
+                "page": page_number,
+                "lines": page_lines,
+                "text": "\n".join(page_text_parts),
+                "selectable_text": selectable_text,
+                "has_images": has_raster_images,
+                "is_scanned": is_scanned,
+                "page_object": page,
+            })
 
-        if font_sizes:
-            body_size = font_sizes.most_common(1)[0][0]
+        # ----------------------------------------------------
+        # HEADING DETECTION FOR DIGITAL PDF PAGES
+        # ----------------------------------------------------
+
+        body_size = (
+            font_sizes.most_common(1)[0][0]
+            if font_sizes
+            else None
+        )
 
         heading_sizes = []
 
@@ -511,11 +766,14 @@ def _extract_pdf(
                     line["size"]
                     for record in page_records
                     for line in record["lines"]
-                    if line["size"]
-                    >= body_size * HEADING_SIZE_RATIO
-                    and len(line["text"]) <= MAX_HEADING_CHARS
-                    and len(line["text"].split())
-                    <= MAX_HEADING_WORDS
+                    if (
+                        line["size"]
+                        >= body_size * HEADING_SIZE_RATIO
+                        and len(line["text"])
+                        <= MAX_HEADING_CHARS
+                        and len(line["text"].split())
+                        <= MAX_HEADING_WORDS
+                    )
                 },
                 reverse=True,
             )[:6]
@@ -525,58 +783,96 @@ def _extract_pdf(
             for index, size in enumerate(heading_sizes)
         }
 
-        # Second pass: create ContentUnit objects.
+        # ----------------------------------------------------
+        # SECOND PASS: EXTRACT EACH PAGE
+        # ----------------------------------------------------
+
         for record in page_records:
 
             page_number = record["page"]
-
+            page_object = record["page_object"]
             page_text = record["text"]
 
-            page_object = record["page_object"]
+            # ------------------------------------------------
+            # SCANNED PDF PAGE
+            # ------------------------------------------------
 
-            # OCR fallback for scanned or nearly empty pages.
-            if (
-                len(page_text) < MIN_TEXT_CHARS_PER_PAGE
-                and _ocr_available()
-            ):
+            if record["is_scanned"]:
+
+                ocr_text = ""
 
                 try:
+
+                    if Image is None:
+                        raise RuntimeError(
+                            "Pillow is not installed. "
+                            "Scanned-page OCR is unavailable."
+                        )
+
                     pixmap = page_object.get_pixmap(
                         dpi=OCR_DPI,
                         alpha=False,
                     )
 
-                    image = Image.frombytes(
+                    rendered_image = Image.frombytes(
                         "RGB",
-                        (pixmap.width, pixmap.height),
+                        (
+                            pixmap.width,
+                            pixmap.height,
+                        ),
                         pixmap.samples,
                     )
 
-                    ocr_text = _ocr_image(image)
-
-                    if ocr_text:
-                        page_text = ocr_text
-
-                        for paragraph in _split_paragraphs(
-                            ocr_text
-                        ):
-                            units.append(
-                                _create_text_unit(
-                                    paragraph,
-                                    page=page_number,
-                                )
-                            )
+                    ocr_text = _ocr_image(
+                        rendered_image
+                    )
 
                 except Exception as exc:
+
                     logger.warning(
-                        "OCR failed on PDF page %s: %s",
+                        "Could not render/OCR scanned PDF page %s: %s",
                         page_number,
                         exc,
                     )
 
+                if ocr_text:
+
+                    for paragraph in _split_paragraphs(
+                        ocr_text
+                    ):
+
+                        units.append(
+                            _create_text_unit(
+                                paragraph,
+                                page=page_number,
+                                extraction_method="ocr",
+                            )
+                        )
+
+                elif page_text.strip():
+
+                    # Preserve selectable text if OCR fails.
+                    units.append(
+                        _create_text_unit(
+                            page_text,
+                            page=page_number,
+                            extraction_method="digital",
+                        )
+                    )
+
+                else:
+
+                    logger.warning(
+                        "Scanned PDF page %s produced no OCR text.",
+                        page_number,
+                    )
+
+            # ------------------------------------------------
+            # DIGITAL PDF PAGE
+            # ------------------------------------------------
+
             else:
 
-                # Separate detected headings from normal text.
                 normal_lines = []
 
                 for line in record["lines"]:
@@ -590,10 +886,12 @@ def _extract_pdf(
                     if heading_level is not None:
 
                         if normal_lines:
+
                             units.append(
                                 _create_text_unit(
                                     "\n".join(normal_lines),
                                     page=page_number,
+                                    extraction_method="digital",
                                 )
                             )
 
@@ -604,6 +902,7 @@ def _extract_pdf(
                                 line_text,
                                 page=page_number,
                                 heading_level=heading_level,
+                                extraction_method="digital",
                             )
                         )
 
@@ -611,14 +910,19 @@ def _extract_pdf(
                         normal_lines.append(line_text)
 
                 if normal_lines:
+
                     units.append(
                         _create_text_unit(
                             "\n".join(normal_lines),
                             page=page_number,
+                            extraction_method="digital",
                         )
                     )
 
-            # Extract embedded images from this page.
+            # ------------------------------------------------
+            # EMBEDDED PDF IMAGE DESCRIPTIONS
+            # ------------------------------------------------
+
             seen_images = set()
 
             try:
@@ -627,6 +931,7 @@ def _extract_pdf(
                 )
 
             except Exception as exc:
+
                 logger.warning(
                     "Could not list images on PDF page %s: %s",
                     page_number,
@@ -648,7 +953,10 @@ def _extract_pdf(
                 seen_images.add(xref)
 
                 try:
-                    extracted = document.extract_image(xref)
+
+                    extracted = document.extract_image(
+                        xref
+                    )
 
                     if not extracted:
                         continue
@@ -685,6 +993,7 @@ def _extract_pdf(
                     )
 
                 except Exception as exc:
+
                     logger.warning(
                         "Could not extract PDF image %s on page %s: %s",
                         image_index,
@@ -695,9 +1004,9 @@ def _extract_pdf(
     return units
 
 
-# ---------------------------------------------------------------------------
-# DOCX extraction
-# ---------------------------------------------------------------------------
+# ============================================================
+# DOCX EXTRACTION
+# ============================================================
 
 _HEADING_STYLE = re.compile(
     r"^heading\s*([1-6])$",
@@ -708,9 +1017,10 @@ _HEADING_STYLE = re.compile(
 def _docx_heading_level(
     paragraph: Any,
 ) -> Optional[int]:
-    """Read heading levels from actual Word paragraph styles."""
+    """Identify heading levels from Word paragraph styles."""
 
     try:
+
         style_name = (
             paragraph.style.name
             if paragraph.style is not None
@@ -737,18 +1047,21 @@ def _extract_docx_images(
     document: Any,
     units: List[ContentUnit],
 ) -> None:
-    """Extract DOCX image descriptions, dimensions and alt text."""
+    """Extract DOCX image descriptions and available metadata."""
 
     try:
+
         drawings = document.element.body.xpath(
             ".//w:drawing"
         )
 
     except Exception as exc:
+
         logger.warning(
             "Could not inspect DOCX images: %s",
             exc,
         )
+
         return
 
     image_index = 0
@@ -756,6 +1069,7 @@ def _extract_docx_images(
     for drawing in drawings:
 
         try:
+
             doc_properties = drawing.xpath(
                 ".//wp:docPr"
             )
@@ -792,6 +1106,7 @@ def _extract_docx_images(
                 relationship_id
                 and relationship_id in document.part.related_parts
             ):
+
                 image_blob = document.part.related_parts[
                     relationship_id
                 ].blob
@@ -803,6 +1118,7 @@ def _extract_docx_images(
             if image_blob and Image is not None:
 
                 try:
+
                     with Image.open(
                         io.BytesIO(image_blob)
                     ) as image:
@@ -835,6 +1151,7 @@ def _extract_docx_images(
             )
 
         except Exception as exc:
+
             logger.warning(
                 "Could not process DOCX image %s: %s",
                 image_index,
@@ -850,11 +1167,13 @@ def _extract_docx(
     _require(docx, "python-docx")
 
     try:
+
         document = docx.Document(
             io.BytesIO(file_bytes)
         )
 
     except Exception as exc:
+
         raise UnsupportedFormatError(
             f"Could not open the DOCX document: {exc}"
         ) from exc
@@ -862,11 +1181,13 @@ def _extract_docx(
     units: List[ContentUnit] = []
 
     try:
+
         blocks = list(
             document.iter_inner_content()
         )
 
     except AttributeError:
+
         # Compatibility with older python-docx versions.
         blocks = list(document.paragraphs)
 
@@ -887,6 +1208,7 @@ def _extract_docx(
                 )
 
                 if row_text:
+
                     units.append(
                         _create_text_unit(
                             row_text,
@@ -902,7 +1224,9 @@ def _extract_docx(
             Paragraph,
         ):
 
-            paragraph_text = _clean(block.text)
+            paragraph_text = _clean(
+                block.text
+            )
 
             if not paragraph_text:
                 continue
@@ -919,8 +1243,7 @@ def _extract_docx(
                 )
             )
 
-    # DOCX does not have fixed page numbers in its document structure.
-    # The existing schema uses page=1 for this extraction.
+    # DOCX does not provide fixed page numbers.
     _extract_docx_images(
         document,
         units,
@@ -929,18 +1252,19 @@ def _extract_docx(
     return units
 
 
-# ---------------------------------------------------------------------------
-# Standalone image extraction
-# ---------------------------------------------------------------------------
+# ============================================================
+# STANDALONE IMAGE EXTRACTION
+# ============================================================
 
 def _extract_image(
     file_bytes: bytes,
 ) -> List[ContentUnit]:
-    """Extract image dimensions, create an image unit and run OCR."""
+    """Extract image information and OCR text."""
 
     _require(Image, "Pillow")
 
     try:
+
         image = Image.open(
             io.BytesIO(file_bytes)
         )
@@ -948,6 +1272,7 @@ def _extract_image(
         image.load()
 
     except Exception as exc:
+
         raise UnsupportedFormatError(
             f"Could not open the image: {exc}"
         ) from exc
@@ -973,7 +1298,7 @@ def _extract_image(
         )
     ]
 
-    # OCR text is returned as a separate text unit.
+    # OCR text is stored separately from the image unit.
     if _ocr_available():
 
         extracted_text = _ocr_image(
@@ -996,9 +1321,9 @@ def _extract_image(
     return units
 
 
-# ---------------------------------------------------------------------------
-# Public API - used by orchestrator.py
-# ---------------------------------------------------------------------------
+# ============================================================
+# PUBLIC API - USED BY ORCHESTRATOR
+# ============================================================
 
 def extract_units(
     *,
@@ -1009,36 +1334,51 @@ def extract_units(
     """
     Extract content from pasted text or an uploaded file.
 
-    This function intentionally preserves the exact interface
-    expected by backend/app/services/orchestrator.py.
+    This function preserves the existing interface expected
+    by backend/app/services/orchestrator.py.
 
-    Exactly one input source should be provided:
-        - text
-        - file_bytes
+    Inputs:
+        text:
+            Pasted text.
+
+        file_name:
+            Uploaded file name.
+
+        file_bytes:
+            Uploaded file content.
 
     Returns:
         List[ContentUnit]
 
     Raises:
         UnsupportedFormatError:
-            If the uploaded file is unsupported, corrupt or cannot
-            be processed due to a required missing dependency.
+            If the file format is unsupported, corrupt,
+            or a required dependency is missing.
     """
 
-    # Pasted text extraction.
+    # --------------------------------------------------------
+    # PASTED TEXT
+    # --------------------------------------------------------
+
     if text is not None:
 
-        paragraphs = _split_paragraphs(text)
+        paragraphs = _split_paragraphs(
+            text
+        )
 
         return [
             _create_text_unit(paragraph)
             for paragraph in paragraphs
         ]
 
-    # File extraction.
+    # --------------------------------------------------------
+    # UPLOADED FILE
+    # --------------------------------------------------------
+
     if file_bytes is not None:
 
         if not file_bytes:
+
             raise UnsupportedFormatError(
                 "The uploaded file is empty."
             )
@@ -1065,3 +1405,22 @@ def extract_units(
             return _extract_image(file_bytes)
 
     return []
+
+
+# ============================================================
+# BACKWARDS-FRIENDLY ALIAS
+# ============================================================
+
+def extract_document(
+    *,
+    text: Optional[str] = None,
+    file_name: Optional[str] = None,
+    file_bytes: Optional[bytes] = None,
+) -> List[ContentUnit]:
+    """Alias for extract_units()."""
+
+    return extract_units(
+        text=text,
+        file_name=file_name,
+        file_bytes=file_bytes,
+    )
