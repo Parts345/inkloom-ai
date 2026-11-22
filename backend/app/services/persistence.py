@@ -1,7 +1,9 @@
-"""Owner: Soham. SQLAlchemy persistence for analysis results, findings, and append-only audit log."""
+"""Owner: Soham. SQLAlchemy persistence for analysis results, visual assets, findings, and audit log."""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
@@ -16,11 +18,36 @@ _SOURCE_TYPE = {
     "fact": "fact",
     "preferred_term": "term",
     "banned_term": "term",
+    "asset": "asset",
 }
 
 _ACTOR_ID_TO_ROLE_NAME = {
     user_id: (role, name) for role, (user_id, name) in DEMO_USERS.items()
 }
+
+
+def get_assets_dir() -> Path:
+    """Resolve /data/approved_assets when /data is writable, otherwise local ./data/approved_assets."""
+    env_dir = os.getenv("APPROVED_ASSETS_DIR")
+    if env_dir:
+        p = Path(env_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    preferred = Path("/data/approved_assets")
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        return preferred
+    except OSError:
+        fallback = Path("./data/approved_assets").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def asset_public_url(image_path: Optional[str]) -> Optional[str]:
+    if not image_path:
+        return None
+    return f"/assets/approved/{Path(image_path).name}"
 
 
 def _naive_utc(dt: Optional[datetime]) -> datetime:
@@ -65,17 +92,20 @@ def add_audit(
 
 
 def save_findings(db: Session, submission_id: str, findings: List[Finding]) -> List[FindingRecord]:
-    """Persist schema Finding objects as FindingRecord rows. Caller commits."""
+    """Persist schema Finding objects (text + VLM visual) as FindingRecord rows. Caller commits."""
     rows: List[FindingRecord] = []
     for f in findings:
         ev = f.evidence
+        explanation = f.explanation
+        if f.visual_notes and f.visual_notes not in explanation:
+            explanation = f"{explanation} [VLM Note: {f.visual_notes}]"
         row = FindingRecord(
             submission_id=submission_id,
             unit_id=f.unit_id,
             category=f.category,
             severity=f.severity,
             original_span=f.original_span,
-            explanation=f.explanation,
+            explanation=explanation,
             evidence_id=ev.evidence_id if ev else None,
             evidence_title=ev.title if ev else None,
             evidence_quote=ev.content if ev else None,
@@ -104,6 +134,7 @@ def save_analysis(
 ) -> SubmissionResponse:
     """Called by orchestrator.analyse_submission() to persist a submission and its findings."""
     actor_role, actor_name = _resolve_actor_fields(actor_id)
+    display_content = current_text.strip() or f"[Visual Submission: {title.strip()}]"
 
     db = SessionLocal()
     try:
@@ -114,8 +145,8 @@ def save_analysis(
                 workspace_id=workspace_id,
                 title=title.strip(),
                 source_format=source_format,
-                original_content=current_text,
-                current_content=current_text,
+                original_content=display_content,
+                current_content=display_content,
                 version=1,
                 status=status,
                 created_by=actor_name,
@@ -132,7 +163,7 @@ def save_analysis(
             )
         else:
             sub.title = title.strip()
-            sub.current_content = current_text
+            sub.current_content = display_content
             sub.version += 1
             sub.status = status
             sub.findings.clear()
@@ -183,6 +214,7 @@ def finding_to_schema(db: Session, rec: FindingRecord) -> Finding:
             content=rec.evidence_quote or (entry.rule_text if entry else ""),
             owner=entry.owner if entry else None,
             expiry_date=entry.expiry_date if entry else None,
+            image_url=asset_public_url(entry.image_path) if entry else None,
         )
     return Finding(
         finding_id=str(rec.id),

@@ -1,4 +1,4 @@
-"""Owner: Soham. SQLAlchemy ORM models for Inkloom AI."""
+"""Owner: Soham. SQLAlchemy ORM models for Inkloom AI (Round 3)."""
 import uuid
 from datetime import datetime, timezone
 
@@ -41,7 +41,8 @@ class KnowledgeEntry(Base):
 
     id = Column(String(64), primary_key=True, default=new_id)
     workspace_id = Column(String(64), ForeignKey("workspaces.id"), nullable=False, index=True)
-    entry_type = Column(String(20), nullable=False)  # guideline | fact | preferred_term | banned_term
+    # guideline | fact | preferred_term | banned_term | asset
+    entry_type = Column(String(20), nullable=False)
     category = Column(String(60), nullable=True)
     title = Column(String(300), nullable=False)
     rule_text = Column(Text, nullable=False)
@@ -50,6 +51,28 @@ class KnowledgeEntry(Base):
     source_doc = Column(String(300), nullable=True)
     expiry_date = Column(Date, nullable=True)
     version = Column(Integer, nullable=False, default=1)
+
+    # Round 3: Approved Visual Asset fields (populated when entry_type == "asset")
+    asset_type = Column(String(20), nullable=True)   # logo | banner | palette
+    image_path = Column(String(500), nullable=True)  # e.g. /data/approved_assets/<file>.png
+    usage_rules = Column(Text, nullable=True)
+
+
+class RuleRefinementProposal(Base):
+    """Round 3 Imp. 3: LLM-synthesized rule rewrite generated from disputed findings."""
+
+    __tablename__ = "rule_refinement_proposals"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workspace_id = Column(String(64), ForeignKey("workspaces.id"), nullable=False, index=True)
+    rule_id = Column(String(64), ForeignKey("knowledge_entries.id"), nullable=False, index=True)
+    dispute_count = Column(Integer, nullable=False, default=0)
+    cluster_summary = Column(Text, nullable=False)
+    proposed_rule_text = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default="pending")  # pending | applied | dismissed
+    created_at = Column(DateTime, nullable=False, default=utcnow)
+    applied_at = Column(DateTime, nullable=True)
+    applied_by = Column(String(120), nullable=True)
 
 
 class Submission(Base):

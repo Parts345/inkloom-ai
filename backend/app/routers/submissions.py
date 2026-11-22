@@ -1,4 +1,4 @@
-"""Owner: Soham. Upload API, review workflow, approval decisions, audit trail, and knowledge endpoints."""
+"""Owner: Soham. Upload API, review workflow, approval decisions, and audit trail."""
 from __future__ import annotations
 
 import base64
@@ -8,16 +8,15 @@ import json
 import logging
 import os
 import time
-from datetime import date, datetime
+from datetime import datetime
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import func
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import FindingRecord, KnowledgeEntry, Submission, Workspace, new_id, utcnow
+from app.models import FindingRecord, Submission, utcnow
 from app.routers.demo import DEMO_MODE, DEMO_USERS, DEMO_WORKSPACE_ID, Actor
 from app.schemas import SubmissionResponse
 from app.services import persistence as P
@@ -93,34 +92,7 @@ def resolve_actor(
     return Actor(user_id=user_id, name=name, role=role, workspace_id=DEMO_WORKSPACE_ID)
 
 
-# --------------------------------------------------------------------------- Request / Response DTOs
-class KnowledgeIn(BaseModel):
-    entry_type: Literal["guideline", "fact", "preferred_term", "banned_term"]
-    category: Optional[str] = None
-    title: str
-    rule_text: str
-    severity: Literal["critical", "major", "minor"] = "minor"
-    owner: Optional[str] = None
-    source_doc: Optional[str] = None
-    expiry_date: Optional[date] = None
-
-
-class KnowledgeOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: str
-    workspace_id: str
-    entry_type: str
-    category: Optional[str] = None
-    title: str
-    rule_text: str
-    severity: str
-    owner: Optional[str] = None
-    source_doc: Optional[str] = None
-    expiry_date: Optional[date] = None
-    version: int
-    is_expired: bool = False
-
-
+# --------------------------------------------------------------------------- DTOs
 class SubmissionSummary(BaseModel):
     submission_id: str
     title: str
@@ -146,14 +118,6 @@ class DecisionIn(BaseModel):
     justification: Optional[str] = None
 
 
-# --------------------------------------------------------------------------- Helpers
-def _workspace(db: Session, workspace_id: str) -> Workspace:
-    ws = db.get(Workspace, workspace_id) or db.query(Workspace).first()
-    if ws is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    return ws
-
-
 def _get_submission(db: Session, submission_id: str) -> Submission:
     sub = db.get(Submission, submission_id)
     if sub is None:
@@ -161,92 +125,7 @@ def _get_submission(db: Session, submission_id: str) -> Submission:
     return sub
 
 
-def _knowledge_out(entry: KnowledgeEntry) -> KnowledgeOut:
-    out = KnowledgeOut.model_validate(entry)
-    out.is_expired = bool(entry.expiry_date and entry.expiry_date < date.today())
-    return out
-
-
-def _refresh_verification_index(db: Session, workspace_id: str) -> None:
-    """Notify Ushank's RAG verification service if it defines a cache/index rebuild hook."""
-    try:
-        from app.services import verification
-    except ImportError:
-        return
-    for hook_name in ("rebuild_workspace_index", "invalidate_index", "reload_knowledge"):
-        hook = getattr(verification, hook_name, None)
-        if callable(hook):
-            try:
-                hook(workspace_id)
-            except TypeError:
-                entries = db.query(KnowledgeEntry).filter_by(workspace_id=workspace_id).all()
-                hook(workspace_id, entries)
-            except Exception:
-                logger.exception("Verification index refresh hook '%s' failed", hook_name)
-            break
-
-
 # --------------------------------------------------------------------------- Submissions & Upload
-@router.get("/analytics")
-def workspace_analytics(
-    actor: Actor = Depends(resolve_actor),
-    db: Session = Depends(get_db),
-) -> dict:
-    total_submissions = db.query(func.count(Submission.id)).filter_by(
-        workspace_id=actor.workspace_id
-    ).scalar() or 0
-    approved_submissions = db.query(func.count(Submission.id)).filter_by(
-        workspace_id=actor.workspace_id,
-        status="approved",
-    ).scalar() or 0
-    approval_rate = round(approved_submissions * 100 / total_submissions) if total_submissions else 0
-
-    rule_name = func.coalesce(
-        func.nullif(func.trim(FindingRecord.evidence_title), ""),
-        FindingRecord.category,
-    )
-    top_rules = (
-        db.query(rule_name.label("rule"), func.count(FindingRecord.id).label("count"))
-        .join(Submission, FindingRecord.submission_id == Submission.id)
-        .filter(Submission.workspace_id == actor.workspace_id)
-        .group_by(rule_name)
-        .order_by(func.count(FindingRecord.id).desc(), rule_name.asc())
-        .limit(5)
-        .all()
-    )
-    by_category = (
-        db.query(FindingRecord.category, func.count(FindingRecord.id).label("count"))
-        .join(Submission, FindingRecord.submission_id == Submission.id)
-        .filter(Submission.workspace_id == actor.workspace_id)
-        .group_by(FindingRecord.category)
-        .order_by(func.count(FindingRecord.id).desc(), FindingRecord.category.asc())
-        .all()
-    )
-    disputed_rules = (
-        db.query(rule_name.label("rule"), func.count(FindingRecord.id).label("disputes"))
-        .join(Submission, FindingRecord.submission_id == Submission.id)
-        .filter(
-            Submission.workspace_id == actor.workspace_id,
-            FindingRecord.status == "disputed",
-        )
-        .group_by(rule_name)
-        .order_by(func.count(FindingRecord.id).desc(), rule_name.asc())
-        .all()
-    )
-
-    return {
-        "total_submissions": int(total_submissions),
-        "approval_rate": int(approval_rate),
-        "top_rules": [{"rule": rule, "count": int(count)} for rule, count in top_rules],
-        "by_category": [
-            {"category": category, "count": int(count)} for category, count in by_category
-        ],
-        "disputed_rules": [
-            {"rule": rule, "disputes": int(disputes)} for rule, disputes in disputed_rules
-        ],
-    }
-
-
 @router.post("/submissions", response_model=SubmissionResponse, status_code=201)
 async def create_submission(
     title: str = Form(..., min_length=1, max_length=200),
@@ -254,6 +133,7 @@ async def create_submission(
     file: Optional[UploadFile] = File(default=None),
     actor: Actor = Depends(resolve_actor),
 ) -> SubmissionResponse:
+    """Accept pasted text, PDF/DOCX, or PNG/JPG images and run concurrent multimodal checks."""
     if actor.role not in SUBMITTING_ROLES:
         raise HTTPException(status_code=403, detail="Your role cannot submit content")
 
@@ -319,7 +199,6 @@ def submit_for_review(
     actor: Actor = Depends(resolve_actor),
     db: Session = Depends(get_db),
 ) -> SubmissionResponse:
-    """Moves a 'draft' or 'revision_required' submission into 'in_review'."""
     if actor.role not in SUBMITTING_ROLES:
         raise HTTPException(status_code=403, detail="Your role cannot submit drafts for review")
     sub = _get_submission(db, submission_id)
@@ -406,13 +285,14 @@ def update_finding(
             raise HTTPException(status_code=422, detail="dispute_reason is required to dispute a finding")
         rec.status = "disputed"
         rec.dispute_reason = reason
+        rule_tag = f" [rule={rec.evidence_id}]" if rec.evidence_id else ""
         P.add_audit(
             db,
             sub.id,
             actor.role,
             actor.name,
             "finding_disputed",
-            f"Finding #{rec.id} ({rec.severity}) disputed: {reason}",
+            f"Finding #{rec.id} ({rec.severity}){rule_tag} disputed: {reason}",
         )
 
     db.commit()
@@ -480,41 +360,3 @@ def decide_submission(
     db.commit()
     db.refresh(sub)
     return P.submission_to_response(db, sub)
-
-
-# --------------------------------------------------------------------------- Knowledge Base
-@router.get("/knowledge", response_model=List[KnowledgeOut])
-def list_knowledge(
-    entry_type: Optional[Literal["guideline", "fact", "preferred_term", "banned_term"]] = None,
-    actor: Actor = Depends(resolve_actor),
-    db: Session = Depends(get_db),
-) -> List[KnowledgeOut]:
-    ws = _workspace(db, actor.workspace_id)
-    q = db.query(KnowledgeEntry).filter_by(workspace_id=ws.id)
-    if entry_type:
-        q = q.filter_by(entry_type=entry_type)
-    entries = q.order_by(KnowledgeEntry.entry_type, KnowledgeEntry.id).all()
-    return [_knowledge_out(e) for e in entries]
-
-
-@router.post("/knowledge", response_model=KnowledgeOut, status_code=201)
-def add_knowledge(
-    body: KnowledgeIn,
-    actor: Actor = Depends(resolve_actor),
-    db: Session = Depends(get_db),
-) -> KnowledgeOut:
-    if actor.role not in APPROVING_ROLES:
-        raise HTTPException(status_code=403, detail="Only approvers or admins can add knowledge entries")
-
-    ws = _workspace(db, actor.workspace_id)
-    entry = KnowledgeEntry(
-        id=new_id(),
-        workspace_id=ws.id,
-        version=1,
-        **body.model_dump(),
-    )
-    db.add(entry)
-    db.commit()
-    db.refresh(entry)
-    _refresh_verification_index(db, ws.id)
-    return _knowledge_out(entry)
