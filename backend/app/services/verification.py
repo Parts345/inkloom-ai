@@ -352,19 +352,36 @@ class LLMProviderClient:
         return bool(self.api_key)
 
     def generate_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.1) -> str:
-        from openai import OpenAI
+        from openai import BadRequestError, OpenAI
 
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        response = client.chat.completions.create(
-            model=self.model,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        return response.choices[0].message.content or "{}"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            response = client.chat.completions.create(
+                model=self.model,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            return response.choices[0].message.content or "{}"
+        except BadRequestError as err:
+            err_text = str(err)
+            if "json_validate_failed" not in err_text and "response_format" not in err_text:
+                raise
+            logger.warning(
+                "JSON response_format rejected by model %s (%s); retrying without response_format",
+                self.model,
+                err,
+            )
+            response = client.chat.completions.create(
+                model=self.model,
+                temperature=temperature,
+                messages=messages,
+            )
+            return response.choices[0].message.content or "{}"
 
 
 # ---- Deterministic fallback helpers ---------------------------------------
