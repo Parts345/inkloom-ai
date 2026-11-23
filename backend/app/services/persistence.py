@@ -131,6 +131,7 @@ def save_analysis(
     findings: List[Finding],
     audit_events: List[AuditEvent],
     source_format: str = "text",
+    llm_verification_failed: bool = False,
 ) -> SubmissionResponse:
     """Called by orchestrator.analyse_submission() to persist a submission and its findings."""
     actor_role, actor_name = _resolve_actor_fields(actor_id)
@@ -195,7 +196,10 @@ def save_analysis(
 
         db.commit()
         db.refresh(sub)
-        return submission_to_response(db, sub)
+        resp = submission_to_response(db, sub)
+        if llm_verification_failed:
+            resp.llm_verification_failed = True
+        return resp
     except Exception:
         db.rollback()
         raise
@@ -203,7 +207,7 @@ def save_analysis(
         db.close()
 
 
-def finding_to_schema(db: Session, rec: FindingRecord) -> Finding:
+def finding_to_schema(db: Session, rec: FindingRecord, draft_text: str = "") -> Finding:
     evidence = None
     if rec.evidence_id:
         entry = db.get(KnowledgeEntry, rec.evidence_id)
@@ -228,6 +232,8 @@ def finding_to_schema(db: Session, rec: FindingRecord) -> Finding:
         confidence=rec.confidence,
         status=rec.status,
         dispute_reason=rec.dispute_reason,
+        # Only a text finding whose span still appears in the draft can be applied inline.
+        editable=rec.category != "visual" and bool(rec.original_span) and rec.original_span in draft_text,
     )
 
 
@@ -243,12 +249,14 @@ def audit_to_schema(row: AuditLog) -> AuditEvent:
 
 
 def submission_to_response(db: Session, sub: Submission) -> SubmissionResponse:
+    llm_failed = any(a.action == "llm_verification_failed" for a in sub.audit_log)
     return SubmissionResponse(
         submission_id=sub.id,
         title=sub.title,
         status=sub.status,  # type: ignore[arg-type]
         version=sub.version,
         current_text=sub.current_content,
-        findings=[finding_to_schema(db, r) for r in sub.findings],
+        findings=[finding_to_schema(db, r, sub.current_content) for r in sub.findings],
         audit_log=[audit_to_schema(a) for a in sub.audit_log],
+        llm_verification_failed=llm_failed,
     )

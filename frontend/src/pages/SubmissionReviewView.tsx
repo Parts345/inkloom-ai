@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Check, X, Flag, History, ShieldAlert, Plus } from 'lucide-react';
-import { api, Finding, Role, Submission } from '../api';
+import { api, Finding, Role, Submission, ocrUnitCount } from '../api';
 import { Card, ErrorNote, SeverityBadge, Spinner, StatusPill, fmt, markStyle } from './ui';
 
 interface Props { role: Role; submissions: Submission[]; activeId: string | null; onSelect: (id: string) => void; onChanged: () => void; onNew: () => void }
@@ -22,9 +22,16 @@ function Highlighted({ text, findings, focus }: { text: string; findings: Findin
   return <p className="whitespace-pre-wrap font-serif text-[15px] leading-7">{parts}</p>;
 }
 
+function noInlineHint(f: Finding): string {
+  if (f.category === 'visual') return 'Visual finding: replace the asset, then reject this finding.';
+  if (!f.editable) return 'This flags the image or its metadata, not draft text. Fix the source file, then reject this finding.';
+  return 'No inline replacement is available. Rewrite this part in the draft, then reject or dispute this finding.';
+}
+
 function FindingCard({ f, onAct, focused, onFocus }: { f: Finding; onAct: (a: 'accept' | 'reject' | 'dispute', r?: string) => Promise<void>; focused: boolean; onFocus: () => void }) {
   const [ev, setEv] = useState(false); const [dispute, setDispute] = useState(false); const [reason, setReason] = useState(''); const [busy, setBusy] = useState(false);
   const done = f.status !== 'open';
+  const isVisualOrBrand = f.category.toLowerCase() === 'visual' || f.category.toLowerCase() === 'brand';
   const act = async (a: 'accept' | 'reject' | 'dispute', r?: string) => { setBusy(true); try { await onAct(a, r); setDispute(false); } finally { setBusy(false); } };
   return (
     <Card className={`p-4 ${focused ? 'ring-2 ring-slate-900' : ''} ${done ? 'opacity-70' : ''}`}>
@@ -44,15 +51,20 @@ function FindingCard({ f, onAct, focused, onFocus }: { f: Finding; onAct: (a: 'a
             ? <span className="font-semibold text-red-700">Expired {fmt(f.evidence.expires_at)}</span> : <>Valid until {fmt(f.evidence.expires_at)}</>}</p>
         </div>)}
       <div className="mt-3 rounded-md border border-slate-200 p-3 font-mono text-xs">
-        <p className="mb-1 font-sans text-xs font-semibold text-slate-500">Suggested minimal edit</p>
-        <p className="bg-red-50 px-1 text-red-800 line-through">{f.original}</p>
-        <p className="mt-1 bg-emerald-50 px-1 text-emerald-800">{f.suggested}</p>
-        {!f.suggested && <p className="mt-1 italic text-slate-500">Remove this text</p>}
+        <p className="mb-1 font-sans text-xs font-semibold text-slate-500">{f.editable && !isVisualOrBrand ? 'Suggested minimal edit' : 'Suggested fix'}</p>
+        {f.editable && !isVisualOrBrand
+          ? <p className="bg-red-50 px-1 text-red-800 line-through">{f.original}</p>
+          : <p className="font-sans text-slate-500">Flagged: <span className="font-mono">{f.original}</span></p>}
+        {f.suggested
+          ? <p className="mt-1 bg-emerald-50 px-1 text-emerald-800">{f.suggested}</p>
+          : <p className="mt-1 whitespace-pre-wrap font-sans italic text-slate-600">{f.fix || noInlineHint(f)}</p>}
       </div>
       {f.dispute_reason && <p className="mt-2 text-xs text-slate-600">Dispute reason: {f.dispute_reason}</p>}
       {!done && (<>
         <div className="mt-3 flex flex-wrap gap-2">
-          <button disabled={busy || !f.suggested.trim()} title={!f.suggested.trim() ? 'No applicable inline text replacement' : undefined} onClick={() => act('accept')} className="flex items-center gap-1 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"><Check size={14} />Accept Edit</button>
+          {!isVisualOrBrand && (
+            <button disabled={busy || !f.suggested.trim()} title={!f.suggested.trim() ? noInlineHint(f) : undefined} onClick={() => act('accept')} className="flex items-center gap-1 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"><Check size={14} />Accept Edit</button>
+          )}
           <button disabled={busy} onClick={() => act('reject')} className="flex items-center gap-1 rounded-md border border-slate-300 px-3 py-1.5 text-sm font-medium"><X size={14} />Reject</button>
           <button disabled={busy} onClick={() => setDispute(!dispute)} className="flex items-center gap-1 rounded-md border border-amber-400 px-3 py-1.5 text-sm font-medium text-amber-900"><Flag size={14} />Dispute</button>
         </div>
@@ -100,31 +112,39 @@ export default function SubmissionReviewView({ role, submissions, activeId, onSe
       {!submissions.length && <Card className="p-10 text-center text-sm text-slate-600">No submissions yet. Create one to see flagged issues.</Card>}
       {activeId && !sub && !err && <Spinner label="Loading submission…" />}
       {sub && (
-        <div className="grid gap-6 lg:grid-cols-2">
-          <section aria-label="Draft content">
-            <Card className="p-5">
-              <div className="mb-3 flex flex-wrap items-center gap-2">
-                <h2 className="mr-auto text-lg font-semibold">{sub.title}</h2>
-                <span className="rounded bg-slate-900 px-2 py-0.5 text-xs font-semibold text-white">v{sub.version}</span><StatusPill s={sub.status} />
-              </div>
-              <div className="mb-3 flex gap-3 text-xs text-slate-600">
-                {(['critical', 'major', 'minor'] as const).map(s => <span key={s} className="flex items-center gap-1"><i className={`h-2.5 w-2.5 rounded-sm ${markStyle[s].split(' ')[0]} border ${s === 'critical' ? 'border-red-500' : s === 'major' ? 'border-amber-500' : 'border-blue-500'}`} />{s}</span>)}
-              </div>
-              <Highlighted text={sub.content} findings={findings} focus={focus} />
-              <button onClick={() => setAudit(!audit)} aria-expanded={audit} className="mt-5 flex items-center gap-2 border-t border-slate-200 pt-3 text-sm font-medium">
-                <History size={14} />Audit trail ({sub.audit?.length ?? 0})</button>
-              {audit && <ol className="mt-2 space-y-2 border-l-2 border-slate-200 pl-4 text-sm">
-                {(sub.audit ?? []).map((a, i) => <li key={i}><b>{a.action}</b> <span className="text-slate-500">by {a.actor}{a.role ? ` (${a.role})` : ''} · {new Date(a.at).toLocaleString()}</span>{a.detail && <p className="text-slate-600">{a.detail}</p>}</li>)}
-              </ol>}
-            </Card>
-          </section>
-          <section aria-label="Findings" className="space-y-3">
-            <h3 className="text-sm font-semibold text-slate-600">{findings.filter(f => f.status === 'open').length} open of {findings.length} findings</h3>
-            {findings.map(f => <FindingCard key={f.id} f={f} onAct={act(f)} focused={focus === f.id}
-              onFocus={() => { setFocus(f.id); document.getElementById(`span-${f.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }} />)}
-            {!findings.length && <Card className="p-6 text-center text-sm text-slate-600">No issues found.</Card>}
-          </section>
-        </div>)}
+        <>
+          {sub.llm_verification_failed && (
+            <div className="mb-4 rounded-md border-l-4 border-amber-500 bg-amber-50 p-4 text-sm font-medium text-amber-900">
+              Claim checks did not run. Re-run or review manually.
+            </div>
+          )}
+          <div className="grid gap-6 lg:grid-cols-2">
+            <section aria-label="Draft content">
+              <Card className="p-5">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <h2 className="mr-auto text-lg font-semibold">{sub.title}</h2>{ocrUnitCount(sub.audit) > 0 && <span title="Text was read from a scanned or image-only PDF using OCR" className="rounded-full bg-violet-100 px-2 py-0.5 text-xs font-semibold text-violet-800 ring-1 ring-violet-200">OCR · {ocrUnitCount(sub.audit)} unit(s)</span>}
+                  <span className="rounded bg-slate-900 px-2 py-0.5 text-xs font-semibold text-white">v{sub.version}</span><StatusPill s={sub.status} />
+                </div>
+                <div className="mb-3 flex gap-3 text-xs text-slate-600">
+                  {(['critical', 'major', 'minor'] as const).map(s => <span key={s} className="flex items-center gap-1"><i className={`h-2.5 w-2.5 rounded-sm ${markStyle[s].split(' ')[0]} border ${s === 'critical' ? 'border-red-500' : s === 'major' ? 'border-amber-500' : 'border-blue-500'}`} />{s}</span>)}
+                </div>
+                <Highlighted text={sub.content} findings={findings} focus={focus} />
+                <button onClick={() => setAudit(!audit)} aria-expanded={audit} className="mt-5 flex items-center gap-2 border-t border-slate-200 pt-3 text-sm font-medium">
+                  <History size={14} />Audit trail ({sub.audit?.length ?? 0})</button>
+                {audit && <ol className="mt-2 space-y-2 border-l-2 border-slate-200 pl-4 text-sm">
+                  {(sub.audit ?? []).map((a, i) => <li key={i}><b>{a.action}</b> <span className="text-slate-500">by {a.actor}{a.role ? ` (${a.role})` : ''} · {new Date(a.at).toLocaleString()}</span>{a.detail && <p className="text-slate-600">{a.detail}</p>}</li>)}
+                </ol>}
+              </Card>
+            </section>
+            <section aria-label="Findings" className="space-y-3">
+              <h3 className="text-sm font-semibold text-slate-600">{findings.filter(f => f.status === 'open').length} open of {findings.length} findings</h3>
+              {findings.map(f => <FindingCard key={f.id} f={f} onAct={act(f)} focused={focus === f.id}
+                onFocus={() => { setFocus(f.id); document.getElementById(`span-${f.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }} />)}
+              {!findings.length && <Card className="p-6 text-center text-sm text-slate-600">No issues found.</Card>}
+            </section>
+          </div>
+        </>
+      )}
       {sub && canReview && (
         <div className="fixed inset-x-0 bottom-0 z-20 border-t border-slate-200 bg-white/95 backdrop-blur">
           <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-2 px-4 py-3">

@@ -10,11 +10,29 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from typing import List, Optional, Tuple
 
 from app.database import SessionLocal
 from app.models import KnowledgeEntry, Workspace
 from app.schemas import ContentUnit, EvidenceItem, Finding
+
+# An organisation name followed by a company suffix, e.g. "DreamTech Organisation", "Acme Ltd".
+_ORG_NAME = re.compile(
+    r"\b((?:[A-Z][\w&.-]*)(?:\s+[A-Z][\w&.-]*){0,2})\s+"
+    r"(Organi[sz]ation|Organi[sz]ations|Inc|Ltd|LLC|Corp|Corporation|Company|Technologies|Group)\b"
+)
+# Words that do not identify a brand when comparing names.
+_GENERIC_NAME_WORDS = {"cloud", "workspace", "group", "company", "technologies", "inc", "ltd", "llc", "corp"}
+_COMMON_MARKETING_WORDS = {
+    "get", "free", "click", "win", "limited", "time", "just", "claim", "now",
+    "earn", "daily", "no", "work", "skills", "money", "too", "be", "winner",
+    "with", "the", "and", "for", "you", "your", "our", "logo", "wordmark", "brand",
+}
+_MARKETING_COPY_MARKERS = {
+    "get", "free", "click", "win", "limited", "claim", "offer", "earn", "discount",
+    "buy", "shop", "save", "sale", "exclusive",
+}
 
 # The shared schema does not currently store per-workspace image-size settings.
 # These conservative defaults can be changed centrally if the team defines a
@@ -28,16 +46,25 @@ MIN_IMAGE_HEIGHT = 1
 MIN_CONTRAST_RATIO = 4.5
 
 
+def normalise_for_checks(text: str) -> str:
+    """Normalize text using Unicode NFKC for robust character and punctuation matching."""
+    return unicodedata.normalize("NFKC", text)
+
+
 def run_checks(units: List[ContentUnit], workspace_id: str) -> List[Finding]:
     """Run deterministic checks and return findings for the supplied units."""
     palette, banned_terms = _load_workspace_rules(workspace_id)
     findings: List[Finding] = []
+
+    workspace_name = _load_workspace_name(workspace_id)
 
     for unit in units:
         findings.extend(_check_color_contrast(unit, palette))
         findings.extend(_check_image_dimensions(unit))
         findings.extend(_check_image_alt_text(unit))
         findings.extend(_check_banned_terms(unit, banned_terms))
+        findings.extend(_check_brand_name(unit, workspace_name))
+        findings.extend(_check_tone(unit))
 
     return findings
 
@@ -62,6 +89,105 @@ def _load_workspace_rules(
         return palette, terms
     finally:
         db.close()
+
+
+def _load_workspace_name(workspace_id: str) -> str:
+    db = SessionLocal()
+    try:
+        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        return workspace.name if workspace else ""
+    finally:
+        db.close()
+
+
+def _check_brand_name(unit: ContentUnit, workspace_name: str) -> List[Finding]:
+    """Flag text that names a different organisation than this workspace.
+
+    Only names followed by a company suffix are checked, so ordinary capitalised phrases are
+    not flagged. The check passes when the name shares a distinctive word with the workspace.
+    """
+    if unit.unit_type != "text" or not unit.content or not workspace_name:
+        return []
+
+    workspace_words = {
+        w.casefold() for w in re.findall(r"[A-Za-z0-9]+", workspace_name) if len(w) > 1
+    } - _GENERIC_NAME_WORDS
+    if not workspace_words:
+        return []
+
+    findings: List[Finding] = []
+    suffix_name_tokens = set()
+    for match in _ORG_NAME.finditer(unit.content):
+        name_prefix = match.group(1)
+        leading_fragments = re.match(r"(?:[A-Za-z]\s+)+", name_prefix)
+        trim_length = leading_fragments.end() if leading_fragments else 0
+        org_name = f"{name_prefix[trim_length:]} {match.group(2)}"
+        original_start = match.start(1) + trim_length
+        org_words = {w.casefold() for w in re.findall(r"[A-Za-z0-9]+", org_name)}
+        suffix_name_tokens.update(org_words)
+        if org_words & workspace_words:
+            continue  # the name refers to this workspace's brand
+        findings.append(
+            _make_finding(
+                unit=unit,
+                category="brand",
+                severity="major",
+                original_span=org_name,
+                explanation=(
+                    f"The content names '{org_name}', which does not match this workspace's brand "
+                    f"'{workspace_name}'. Confirm the material belongs to this brand before publishing."
+                ),
+                suggested_edit=None,
+                rule_key=f"brand-mismatch:{org_name.casefold()}:{original_start}",
+            )
+        )
+
+    content_words = {
+        word.casefold() for word in re.findall(r"[A-Za-z0-9]+", unit.content)
+    }
+    if not content_words & _MARKETING_COPY_MARKERS:
+        return findings
+
+    lines = unit.content.splitlines()
+    first_three_lines = lines[:3]
+    logo_area_tokens = {
+        token.casefold()
+        for line in lines
+        if re.search(r"\b(?:logo|wordmark|brand)\b", line, flags=re.IGNORECASE)
+        for token in re.findall(r"\b[A-Z][A-Za-z0-9]{1,}\b", line)
+    }
+    checked_tokens = set()
+    for line in first_three_lines:
+        for token in re.findall(r"\b[A-Z][A-Za-z0-9]{1,}\b", line):
+            token_key = token.casefold()
+            if (
+                token_key in _COMMON_MARKETING_WORDS
+                or token_key in workspace_words
+                or token_key in suffix_name_tokens
+                or token_key in checked_tokens
+            ):
+                continue
+
+            is_camel_case = any(char.isupper() for char in token[1:])
+            if not is_camel_case and token_key not in logo_area_tokens:
+                continue
+
+            checked_tokens.add(token_key)
+            findings.append(
+                _make_finding(
+                    unit=unit,
+                    category="brand",
+                    severity="major",
+                    original_span=token,
+                    explanation=(
+                        f"The content names '{token}', which does not match this workspace's brand "
+                        f"'{workspace_name}'. Confirm the material belongs to this brand before publishing."
+                    ),
+                    suggested_edit=None,
+                    rule_key=f"brand-mismatch-token:{token_key}:{lines.index(line)}",
+                )
+            )
+    return findings
 
 
 def _check_color_contrast(
@@ -158,6 +284,8 @@ def _check_image_alt_text(unit: ContentUnit) -> List[Finding]:
     """Flag an image when extraction did not provide any alt-text value."""
     if unit.unit_type != "image":
         return []
+    if getattr(unit.metadata, "embedded", False):
+        return []
 
     alt_text = unit.metadata.alt_text
     if alt_text is not None and alt_text.strip():
@@ -180,25 +308,97 @@ def _check_image_alt_text(unit: ContentUnit) -> List[Finding]:
     ]
 
 
+def _map_norm_span(orig_text: str, norm_text: str, start: int, end: int) -> Tuple[int, int]:
+    if len(orig_text) == len(norm_text):
+        return start, end
+    cur_norm = 0
+    orig_start = 0
+    orig_end = len(orig_text)
+    start_found = False
+    for i, ch in enumerate(orig_text):
+        if cur_norm >= start and not start_found:
+            orig_start = i
+            start_found = True
+        cur_norm += len(unicodedata.normalize("NFKC", ch))
+        if cur_norm >= end:
+            orig_end = i + 1
+            break
+    return orig_start, orig_end
+
+
+def _check_tone(unit: ContentUnit) -> List[Finding]:
+    """Flag exclamation marks in customer-facing copy as one tone finding per ContentUnit."""
+    if unit.unit_type != "text" or not unit.content:
+        return []
+
+    source_lines = unit.content.splitlines()
+    check_lines = normalise_for_checks(unit.content).splitlines()
+    flagged_lines = [
+        source_line
+        for source_line, check_line in zip(source_lines, check_lines)
+        if "!" in check_line
+    ]
+    if not flagged_lines:
+        return []
+
+    original_span = flagged_lines[0].strip()
+    if original_span not in unit.content and flagged_lines[0] in unit.content:
+        original_span = flagged_lines[0]
+
+    line_count = len(flagged_lines)
+    line_word = "line" if line_count == 1 else "lines"
+    explanation = (
+        f"Exclamation marks appear on {line_count} {line_word}, which can make the copy "
+        "feel overly emphatic and conflict with the brand voice."
+    )
+    return [
+        _make_finding(
+            unit=unit,
+            category="tone",
+            severity="minor",
+            original_span=original_span,
+            explanation=explanation,
+            rule_key=f"tone-exclamation:{len(flagged_lines)}",
+            suggested_edit=re.sub(r"[!！]+", "", original_span).strip(),
+        )
+    ]
+
+
 def _check_banned_terms(
     unit: ContentUnit, banned_terms: List[KnowledgeEntry]
 ) -> List[Finding]:
-    """Find every whole-term occurrence while preserving its original casing."""
+    """Find normalized whole-term occurrences and preserve exact source spans."""
     if unit.unit_type != "text" or not unit.content:
         return []
 
     findings: List[Finding] = []
+    norm_content = normalise_for_checks(unit.content)
+
     for entry in banned_terms:
         phrase = (entry.title or "").strip()
         if not phrase:
             continue
 
+        normalized_phrase = "".join(
+            char for char in normalise_for_checks(phrase).casefold() if char.isalnum() or char in "'%"
+        )
+        if not normalized_phrase:
+            continue
+
+        separated_chars = r"(?:(?!['%])[\W_])*".join(
+            re.escape(char) for char in normalized_phrase
+        )
         pattern = re.compile(
-            rf"(?<!\w){re.escape(phrase)}(?!\w)",
+            rf"(?<!\w){separated_chars}(?!\w)",
             flags=re.IGNORECASE,
         )
 
-        for match in pattern.finditer(unit.content):
+        for match in pattern.finditer(norm_content):
+            start, end = _map_norm_span(unit.content, norm_content, match.start(), match.end())
+            original_span = unit.content[start:end]
+            if not original_span or original_span not in unit.content:
+                original_span = match.group(0)
+
             evidence = EvidenceItem(
                 evidence_id=entry.id,
                 source_type="term",
@@ -212,14 +412,14 @@ def _check_banned_terms(
                     unit=unit,
                     category="terminology",
                     severity=_valid_severity(entry.severity),
-                    original_span=match.group(0),
+                    original_span=original_span,
                     explanation=(
-                        f"'{match.group(0)}' is listed as a banned term for this "
+                        f"'{original_span}' is listed as a banned term for this "
                         f"workspace. {entry.rule_text}"
                     ).strip(),
                     evidence=evidence,
                     suggested_edit=None,
-                    rule_key=f"banned-term:{entry.id}:{match.start()}:{match.end()}",
+                    rule_key=f"banned-term:{entry.id}:{start}:{end}",
                 )
             )
 

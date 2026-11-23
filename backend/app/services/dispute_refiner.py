@@ -13,6 +13,7 @@ import logging
 import os
 import re
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, List, Literal, Optional, Sequence
 
 from pydantic import BaseModel, Field, ValidationError
@@ -25,6 +26,18 @@ except ImportError:
     HAS_OPENAI = False
 
 logger = logging.getLogger(__name__)
+
+
+_PROVIDER_BASE_URLS = {
+    "groq": "https://api.groq.com/openai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+}
+
+
+def _provider_base_url() -> "Optional[str]":
+    """Base URL for LLM_PROVIDER, matching services/verification.py. None means the OpenAI default."""
+    provider = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+    return _PROVIDER_BASE_URLS.get(provider)
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +100,74 @@ class RuleRefinementProposalOutput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Creator dispute reason clustering (deterministic, no LLM needed)
+# ---------------------------------------------------------------------------
+
+_REASON_STOPWORDS = {
+    "the", "and", "for", "that", "this", "with", "from", "have", "were", "been", "when", "what",
+    "your", "their", "about", "into", "only", "also", "they", "them", "rule", "flagged", "text",
+    "used", "using", "disputed", "dispute", "creator", "reason", "because", "should", "would",
+    "could", "does", "not", "but", "can", "is", "are", "was", "its", "it", "our", "here",
+    "without", "detailed", "note", "there", "they're", "need", "needs",
+}
+
+
+@dataclass
+class ReasonCluster:
+    """A group of creator dispute reasons that share vocabulary."""
+
+    label: str
+    count: int
+    samples: List[str]
+
+
+def _reason_tokens(text: str) -> set:
+    return {t for t in re.findall(r"[a-z]{3,}", text.lower()) if t not in _REASON_STOPWORDS}
+
+
+def cluster_dispute_reasons(reasons: Sequence[str], threshold: float = 0.3) -> List[ReasonCluster]:
+    """Group dispute reasons by word overlap (Jaccard similarity against each cluster).
+
+    A reason joins the most similar existing cluster when similarity is at least `threshold`,
+    otherwise it starts a new cluster. Clusters are returned largest first. Each label holds
+    the three most common words in the cluster.
+    """
+    members: List[dict] = []
+    for reason in reasons:
+        text = (reason or "").strip()
+        if not text:
+            continue
+        tokens = _reason_tokens(text)
+
+        best, best_score = None, 0.0
+        for member in members:
+            union = member["tokens"] | tokens
+            score = len(member["tokens"] & tokens) / len(union) if union else 0.0
+            if score > best_score:
+                best, best_score = member, score
+
+        if best is not None and best_score >= threshold:
+            best["tokens"] |= tokens
+            best["counter"].update(tokens)
+            best["reasons"].append(text)
+        else:
+            members.append({"tokens": set(tokens), "counter": Counter(tokens), "reasons": [text]})
+
+    clusters = []
+    for member in members:
+        top_words = [word for word, _ in member["counter"].most_common(3)]
+        clusters.append(
+            ReasonCluster(
+                label=", ".join(top_words) if top_words else "general wording",
+                count=len(member["reasons"]),
+                samples=list(dict.fromkeys(member["reasons"]))[:3],
+            )
+        )
+    clusters.sort(key=lambda c: (-c.count, c.label))
+    return clusters
+
+
 class DisputeRefiner:
     """
     Synthesizes creator dispute clusters into calibrated brand governance rule updates.
@@ -137,11 +218,11 @@ class DisputeRefiner:
             or os.getenv("GROQ_API_KEY")
             or os.getenv("GEMINI_API_KEY")
         )
-        self.base_url = base_url or os.getenv("LLM_BASE_URL")
+        self.base_url = base_url or _provider_base_url() or os.getenv("LLM_BASE_URL")
         if not self.base_url and os.getenv("GROQ_API_KEY") and not os.getenv("GEMINI_API_KEY"):
-            self.base_url = "[https://api.groq.com/openai/v1](https://api.groq.com/openai/v1)"
+            self.base_url = "https://api.groq.com/openai/v1"
         elif not self.base_url and os.getenv("GEMINI_API_KEY"):
-            self.base_url = "[https://generativelanguage.googleapis.com/v1beta/openai/](https://generativelanguage.googleapis.com/v1beta/openai/)"
+            self.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
         self.model = (
             model
@@ -182,6 +263,12 @@ class DisputeRefiner:
                 f"Creator dispute reason: \"{d.dispute_reason}\""
             )
         disputes_block = "\n".join(dispute_lines) or "No dispute records supplied."
+        themes = [
+            f"- {c.label} ({c.count} dispute(s))"
+            for c in cluster_dispute_reasons([d.dispute_reason for d in disputes])
+        ]
+        if themes:
+            disputes_block += "\n\nClustered dispute themes:\n" + "\n".join(themes)
 
         system_prompt = (
             "You are Inkloom AI's Brand Governance Policy Architect. Analyze recurring creator disputes "
@@ -261,6 +348,9 @@ class DisputeRefiner:
             f"Across {len(disputes)} creator dispute(s) on '{rule.title}', creators consistently "
             f"contested flags involving {themes_str}.{snippet_note}"
         )
+        theme_clusters = cluster_dispute_reasons([d.dispute_reason for d in disputes])
+        if len(theme_clusters) > 1:
+            cluster_summary += " Distinct themes: " + "; ".join(c.label for c in theme_clusters[:3]) + "."
 
         if diagnosis == "overly_broad":
             proposed_rule_text = (
@@ -346,3 +436,41 @@ class DisputeRefiner:
                 exc,
             )
             return self.deterministic_fallback(rule, disputes)
+
+
+async def refine_disputed_rule(
+    rule_id: str,
+    rule_title: str,
+    rule_text: str,
+    disputes: list[dict],
+) -> dict:
+    """Entry point called by app.routers.analytics for each disputed rule.
+
+    Runs DisputeRefiner.refine_rule in a worker thread (it makes a blocking HTTP call when
+    an LLM key is configured) and returns the plain fields the analytics router reads.
+    """
+    import asyncio
+
+    def _run() -> dict:
+        refiner = DisputeRefiner()
+        rule = RuleEntryInput(
+            rule_id=str(rule_id),
+            title=(rule_title or str(rule_id)).strip(),
+            description=(rule_text or rule_title or "Brand rule").strip(),
+        )
+        records = [
+            CreatorDisputeRecord(
+                dispute_reason=(d.get("dispute_reason") or "").strip() or "Disputed without a note",
+                flagged_text=d.get("original_span") or "",
+                submission_title=d.get("submission_title") or "Untitled Submission",
+            )
+            for d in disputes
+        ]
+        result = refiner.refine_rule(rule, records)
+        return {
+            "cluster_summary": result.cluster_summary,
+            "proposed_rule_text": result.proposed_rule_text,
+            "diagnosis": result.diagnosis,
+        }
+
+    return await asyncio.to_thread(_run)

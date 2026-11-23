@@ -10,6 +10,12 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      # Vision model for image checks. Leave empty to use deterministic image checks only.
+      VLM_PROVIDER: ${VLM_PROVIDER:-}
+      VLM_API_KEY: ${VLM_API_KEY:-}
+      VLM_BASE_URL: ${VLM_BASE_URL:-}
+      VLM_MODEL: ${VLM_MODEL:-}
     volumes:
       - inkloom-data:/data
 

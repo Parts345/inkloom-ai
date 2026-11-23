@@ -73,9 +73,11 @@ except ImportError:
 
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFilter, ImageOps
 except ImportError:
     Image = None
+    ImageFilter = None
+    ImageOps = None
 
 
 try:
@@ -173,6 +175,8 @@ def _create_text_unit(
 
     if extraction_method is not None:
         metadata["extraction_method"] = extraction_method
+        if extraction_method == "ocr":
+            metadata["is_ocr"] = True
 
     return ContentUnit(
         unit_id=_new_unit_id(),
@@ -228,12 +232,22 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+def _is_single_character_line(text: str) -> bool:
+    return len(_clean(text)) == 1
+
+
+def _drop_single_character_lines(text: str) -> str:
+    return "\n".join(
+        line for line in text.splitlines() if not _is_single_character_line(line)
+    )
+
+
 def _split_paragraphs(text: str) -> List[str]:
     """Split text into separate paragraphs."""
 
     return [
         paragraph.strip()
-        for paragraph in re.split(r"\n\s*\n", text)
+        for paragraph in re.split(r"\n\s*\n", _drop_single_character_lines(text))
         if paragraph.strip()
     ]
 
@@ -400,13 +414,13 @@ def _rapidocr_text(image: Any) -> str:
     """
     Extract text using RapidOCR.
 
-    Results are sorted from top to bottom and left to right
-    to preserve the visual reading order.
+    Results are sorted in reading order and grouped into lines by vertical spacing.
     """
 
     engine = _get_rapidocr_engine()
 
     if engine is None or np is None:
+        logger.info("OCR engine=rapidocr lines=0")
         return ""
 
     try:
@@ -417,27 +431,27 @@ def _rapidocr_text(image: Any) -> str:
 
         # rapidocr-onnxruntime returns:
         # (detections, elapsed_time)
-        detections = (
-            result[0]
-            if isinstance(result, tuple)
-            else result
-        )
+        detections = result[0] if isinstance(result, tuple) else result
 
         if not detections:
+            logger.info("OCR engine=rapidocr lines=0")
             return ""
 
-        ordered: List[Tuple[float, float, str]] = []
+        ordered: List[Tuple[float, float, float, str]] = []
 
         for detection in detections:
-
-            if not detection or len(detection) < 2:
+            if not detection or len(detection) < 3:
                 continue
 
-            box = detection[0]
+            box, raw_text, raw_score = detection[:3]
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if score < 0.5:
+                continue
 
-            recognized_text = _clean(
-                str(detection[1] or "")
-            )
+            recognized_text = _clean(str(raw_text or ""))
 
             if not recognized_text:
                 continue
@@ -450,22 +464,37 @@ def _rapidocr_text(image: Any) -> str:
 
                 top = float(points[:, 1].min())
                 left = float(points[:, 0].min())
+                height = float(points[:, 1].max() - top)
 
             except Exception:
-                top = 0.0
-                left = 0.0
+                continue
 
             ordered.append(
-                (top, left, recognized_text)
+                (top, left, height, recognized_text)
             )
 
         ordered.sort(
             key=lambda item: (item[0], item[1])
         )
 
-        return _clean(
-            "\n".join(item[2] for item in ordered)
-        )
+        lines: List[str] = []
+        previous_y: Optional[float] = None
+        previous_height = 0.0
+        for top, _, height, recognized_text in ordered:
+            if lines:
+                line_threshold = (previous_height + height) / 4
+                if top - previous_y > line_threshold:
+                    lines.append(recognized_text)
+                else:
+                    lines[-1] += " " + recognized_text
+            else:
+                lines.append(recognized_text)
+            previous_y = top
+            previous_height = height
+
+        logger.info("OCR engine=rapidocr lines=%s", len(lines))
+        lines = [line for line in lines if not _is_single_character_line(line)]
+        return _clean("\n".join(lines))
 
     except Exception as exc:
 
@@ -473,6 +502,7 @@ def _rapidocr_text(image: Any) -> str:
             "RapidOCR failed; trying Tesseract fallback: %s",
             exc,
         )
+        logger.info("OCR engine=rapidocr lines=0")
 
         return ""
 
@@ -481,17 +511,19 @@ def _rapidocr_text(image: Any) -> str:
 # TESSERACT FALLBACK
 # ============================================================
 
-def _tesseract_text(image: Any) -> str:
+def _tesseract_text(image: Any, psm: Optional[int] = None) -> str:
     """Extract text using Tesseract in visual reading order."""
 
     if not _tesseract_available():
         return ""
 
     try:
+        options = {"config": f"--psm {psm}"} if psm is not None else {}
         data = pytesseract.image_to_data(
             image.convert("RGB"),
             lang=OCR_LANG,
             output_type=pytesseract.Output.DICT,
+            **options,
         )
 
         lines = {}
@@ -539,7 +571,7 @@ def _tesseract_text(image: Any) -> str:
         )
 
         return _clean(
-            "\n".join(item[2] for item in ordered_lines)
+            _drop_single_character_lines("\n".join(item[2] for item in ordered_lines))
         )
 
     except Exception as exc:
@@ -556,30 +588,283 @@ def _tesseract_text(image: Any) -> str:
 # OCR ROUTER
 # ============================================================
 
+def _preprocess_ocr_image(image: Any) -> Any:
+    """Normalize image text for OCR without enlarging its long side past 3000px."""
+    if Image is None or ImageFilter is None or ImageOps is None:
+        return image
+
+    processed = image.convert("L")
+    width, height = processed.size
+    shorter_side = min(width, height)
+    longer_side = max(width, height)
+
+    if shorter_side < 1500:
+        scale = min(1500 / shorter_side, 3000 / longer_side)
+        if scale > 1:
+            processed = processed.resize(
+                (round(width * scale), round(height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+
+    return ImageOps.autocontrast(processed).filter(ImageFilter.SHARPEN)
+
+
 def _ocr_image(image: Any) -> str:
     """
-    Use RapidOCR first.
-
-    If RapidOCR is unavailable or fails to return text,
-    try Tesseract as a fallback.
+    Use RapidOCR first and fall back to Tesseract only when it finds no text.
     """
-
-    rapid_text = _rapidocr_text(image)
-
+    processed_image = _preprocess_ocr_image(image)
+    rapid_text = _rapidocr_text(processed_image)
     if rapid_text:
+        logger.info("OCR engine=rapidocr selected")
         return rapid_text
 
-    fallback_text = _tesseract_text(image)
+    logger.info("OCR engine=tesseract selected")
+    fallback_text = _tesseract_text(processed_image)
+    return fallback_text
 
-    if fallback_text:
-        return fallback_text
 
-    return ""
+_DEFAULT_OCR_IMAGE = _ocr_image
 
 
 # ============================================================
 # PDF EXTRACTION
 # ============================================================
+
+OCR_HEADING_RATIO = 1.3
+MAX_EMBEDDED_IMAGES = int(os.getenv("MAX_EMBEDDED_IMAGES", "20"))
+
+
+def _rapidocr_entries(image: Any) -> Optional[List[Tuple[float, float, float, str]]]:
+    """Return (top, left, height, text) for every RapidOCR detection with score >= 0.5.
+
+    Returns None when RapidOCR is unavailable, so the caller can use Tesseract. Returns []
+    when RapidOCR ran and found no text.
+    """
+    engine = _get_rapidocr_engine()
+    if engine is None or np is None:
+        return None
+
+    try:
+        result = engine(np.asarray(image.convert("RGB")))
+        detections = result[0] if isinstance(result, tuple) else result
+        if not detections:
+            return []
+
+        measured_entries: List[Tuple[float, float, float, float, str]] = []
+        for detection in detections:
+            if not detection or len(detection) < 3:
+                continue
+            box, raw_text, raw_score = detection[:3]
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if score < 0.5:
+                continue
+            text = _clean(str(raw_text or ""))
+            if not text:
+                continue
+            try:
+                points = np.asarray(box, dtype=float).reshape(-1, 2)
+                top = float(points[:, 1].min())
+                left = float(points[:, 0].min())
+                height = float(points[:, 1].max() - top)
+                width = float(points[:, 0].max() - left)
+            except Exception:
+                continue
+
+            dropped = bool(len(text) == 1 and text.isalpha() and width < 1.5 * height)
+            logger.info(
+                "OCR box text=%r score=%.2f width=%.0f height=%.0f dropped=%s",
+                text,
+                score,
+                width,
+                height,
+                dropped,
+            )
+            if dropped:
+                logger.debug(
+                    "Dropping narrow single letter logo text=%r width=%.0f height=%.0f",
+                    text,
+                    width,
+                    height,
+                )
+                continue
+
+            measured_entries.append((top, left, height, width, text))
+
+        ordered_entries = sorted(measured_entries, key=lambda entry: (entry[0], entry[1]))
+        lines: List[List[Tuple[float, float, float, float, str]]] = []
+        for entry in ordered_entries:
+            top, _left, height, _width, _text = entry
+            previous = lines[-1][-1] if lines else None
+            if previous and (top - previous[0]) <= (previous[2] + height) / 4:
+                lines[-1].append(entry)
+            else:
+                lines.append([entry])
+
+        retained: List[Tuple[float, float, float, str]] = []
+        for line in lines:
+            for top, left, height, width, text in line:
+                if len(line) == 1 and _is_single_character_line(text):
+                    continue
+                retained.append((top, left, height, text))
+        return retained
+
+    except Exception as exc:
+        logger.warning("RapidOCR layout pass failed: %s", exc)
+        return None
+
+
+def _group_ocr_entries(
+    entries: List[Tuple[float, float, float, str]],
+) -> List[Tuple[str, bool]]:
+    """Turn OCR boxes into (text, is_heading) blocks using line height and vertical gaps.
+
+    Entries are read top to bottom, left to right, and merged into lines using the same spacing
+    rule as _rapidocr_text. A line taller than OCR_HEADING_RATIO times the median line height,
+    and short enough to be a title, becomes its own heading block. Other lines form paragraphs,
+    which break where the vertical gap exceeds one median line height.
+    """
+    if not entries:
+        return []
+
+    ordered = sorted(entries, key=lambda e: (e[0], e[1]))
+    heights = sorted(e[2] for e in ordered if e[2] > 0)
+    median_height = heights[len(heights) // 2] if heights else 0.0
+
+    lines: List[dict] = []
+    for top, _left, height, text in ordered:
+        if lines and (top - lines[-1]["top"]) <= (lines[-1]["height"] + height) / 4:
+            lines[-1]["text"] += " " + text
+            lines[-1]["height"] = max(lines[-1]["height"], height)
+        else:
+            lines.append({"top": top, "height": height, "text": text})
+
+    blocks: List[Tuple[str, bool]] = []
+    paragraph: List[str] = []
+    previous_bottom: Optional[float] = None
+
+    def flush() -> None:
+        if paragraph:
+            blocks.append((" ".join(paragraph), False))
+            paragraph.clear()
+
+    for line in lines:
+        bottom = line["top"] + line["height"]
+        is_heading = (
+            median_height > 0
+            and line["height"] >= median_height * OCR_HEADING_RATIO
+            and len(line["text"]) <= MAX_HEADING_CHARS
+            and len(line["text"].split()) <= MAX_HEADING_WORDS
+        )
+        if is_heading:
+            flush()
+            blocks.append((line["text"], True))
+        else:
+            if (
+                previous_bottom is not None
+                and median_height > 0
+                and (line["top"] - previous_bottom) > median_height
+            ):
+                flush()
+            paragraph.append(line["text"])
+        previous_bottom = bottom
+
+    flush()
+    return blocks
+
+
+def _ocr_page_blocks(image: Any) -> List[Tuple[str, bool]]:
+    """OCR one rendered scanned page into (text, is_heading) blocks.
+
+    RapidOCR gives box heights, so layout (headings and paragraph breaks) is available. When it
+    finds nothing, Tesseract is used and its text is split into paragraphs without headings.
+    """
+    if globals().get("_ocr_image") is not _DEFAULT_OCR_IMAGE:
+        fallback_text = _ocr_image(image)
+        return [(paragraph, False) for paragraph in _split_paragraphs(fallback_text)]
+
+    processed = _preprocess_ocr_image(image)
+
+    entries = _rapidocr_entries(processed)
+    if entries:
+        logger.info("OCR engine=rapidocr layout entries=%s", len(entries))
+        return _group_ocr_entries(entries)
+
+    fallback_text = _tesseract_text(processed)
+    if not fallback_text:
+        return []
+    logger.info("OCR engine=tesseract layout fallback (no heading detection)")
+    return [(paragraph, False) for paragraph in _split_paragraphs(fallback_text)]
+
+
+def extract_embedded_images(
+    file_bytes: bytes,
+    file_name: Optional[str],
+) -> List[Tuple[bytes, str, Optional[int]]]:
+    """Return (image_bytes, file_name, page) for pictures embedded in a PDF or DOCX.
+
+    These images were not uploaded on their own, but they are part of the document, so the
+    vision check reviews them too. Icons and tiny images are skipped, and at most
+    MAX_EMBEDDED_IMAGES are returned.
+    """
+    suffix = Path(file_name).suffix.lower() if file_name else ""
+    results: List[Tuple[bytes, str, Optional[int]]] = []
+
+    if suffix == ".pdf":
+        if fitz is None:
+            return []
+        try:
+            document = fitz.open(stream=file_bytes, filetype="pdf")
+        except Exception:
+            return []
+
+        with document:
+            seen_xrefs: set = set()
+            for page_index in range(min(document.page_count, MAX_PAGES)):
+                page = document[page_index]
+                for image_index, image_ref in enumerate(page.get_images(full=True), start=1):
+                    if len(results) >= MAX_EMBEDDED_IMAGES:
+                        return results
+                    xref = image_ref[0]
+                    if xref in seen_xrefs:
+                        continue
+                    seen_xrefs.add(xref)
+                    try:
+                        info = document.extract_image(xref)
+                    except Exception:
+                        continue
+                    if (
+                        int(info.get("width", 0)) < MIN_IMAGE_SIDE_PX
+                        or int(info.get("height", 0)) < MIN_IMAGE_SIDE_PX
+                    ):
+                        continue
+                    image_ext = (info.get("ext") or "png").lower()
+                    results.append(
+                        (info["image"], f"page{page_index + 1}-image{image_index}.{image_ext}", page_index + 1)
+                    )
+        return results
+
+    if suffix == ".docx":
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(file_bytes))
+        except zipfile.BadZipFile:
+            return []
+        with archive:
+            for member in sorted(archive.namelist()):
+                if not member.startswith("word/media/"):
+                    continue
+                if Path(member).suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+                if len(results) >= MAX_EMBEDDED_IMAGES:
+                    break
+                results.append((archive.read(member), Path(member).name, None))
+        return results
+
+    return results
+
 
 def _extract_pdf(file_bytes: bytes) -> List[ContentUnit]:
     """
@@ -799,7 +1084,7 @@ def _extract_pdf(file_bytes: bytes) -> List[ContentUnit]:
 
             if record["is_scanned"]:
 
-                ocr_text = ""
+                ocr_blocks: List[Tuple[str, bool]] = []
 
                 try:
 
@@ -823,9 +1108,7 @@ def _extract_pdf(file_bytes: bytes) -> List[ContentUnit]:
                         pixmap.samples,
                     )
 
-                    ocr_text = _ocr_image(
-                        rendered_image
-                    )
+                    ocr_blocks = _ocr_page_blocks(rendered_image)
 
                 except Exception as exc:
 
@@ -835,16 +1118,14 @@ def _extract_pdf(file_bytes: bytes) -> List[ContentUnit]:
                         exc,
                     )
 
-                if ocr_text:
+                if ocr_blocks:
 
-                    for paragraph in _split_paragraphs(
-                        ocr_text
-                    ):
-
+                    for block_text, is_heading in ocr_blocks:
                         units.append(
                             _create_text_unit(
-                                paragraph,
+                                block_text,
                                 page=page_number,
+                                heading_level=1 if is_heading else None,
                                 extraction_method="ocr",
                             )
                         )

@@ -246,6 +246,11 @@ def update_finding(
         raise HTTPException(status_code=409, detail="Finding was already accepted and applied")
 
     if body.action == "accept":
+        if rec.category == "visual":
+            raise HTTPException(
+                status_code=400,
+                detail="Visual findings cannot be applied as a text edit. Replace the asset, then reject this finding.",
+            )
         if not rec.suggested_edit:
             raise HTTPException(
                 status_code=400,

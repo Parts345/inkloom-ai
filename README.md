@@ -86,3 +86,29 @@ npm run dev
 * **Ushank Ajit Rajeshirke** — AI/ML Developer
 * **Riyesh Gurjar** — Document & Image Processing Developer
 * **Yash Dilipkumar Jayant** — Frontend Developer & QA Lead
+
+## Round 3 features
+
+- **Scanned-PDF OCR.** Pages with no text layer are rendered and read with Tesseract (`tesseract-ocr` is installed in the image). Extraction logs `ocr_units=N` in the audit trail, and the review page shows an OCR badge.
+- **Approved visual assets.** Approvers and Admins upload logos, banners, or palettes in Brand Knowledge Base. Campaign images are checked against them by a vision model (`VLM_MODEL`). Without a vision-capable model, or without an API key, deterministic OpenCV and Pillow checks run instead.
+- **Dispute-driven rule refinement.** Governance Analytics clusters creator disputes by rule and proposes an updated rule. Admins apply it with one click, which re-indexes the Knowledge Base and writes to the audit trail. Disputes raised before the last update are not proposed again.
+
+### Environment
+
+| Variable | Purpose |
+|---|---|
+| `LLM_PROVIDER` | `groq` or `gemini`. Sets the endpoint when `LLM_BASE_URL` is unset. |
+| `LLM_API_KEY` | Key for the text, dispute, and vision checks. |
+| `LLM_MODEL` | Text and dispute model, for example `openai/gpt-oss-120b`. |
+| `VLM_MODEL` | Vision model. Set this to a model your provider lists as vision-capable. |
+
+### Smoke test
+
+    cd backend && python -m tests.fixtures.make_fixtures
+
+Upload `scanned_sample.pdf` to check OCR. Upload `off_brand_logo.png` after an approved logo exists, to check the vision check. See `backend/tests/fixtures/README.md`.
+
+### Governance analytics
+
+- `approval_rate` is approved divided by (approved + rejected) submissions.
+- `top_rules` and `disputed_rules` group findings by the rule they cite.

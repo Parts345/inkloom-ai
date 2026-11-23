@@ -17,7 +17,7 @@ import mimetypes
 import os
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union
+from typing import Any, List, Literal, Mapping, Optional, Sequence, Union
 
 from PIL import Image, ImageStat
 from pydantic import BaseModel, Field, ValidationError
@@ -40,9 +40,50 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+_PROVIDER_BASE_URLS = {
+    "groq": "https://api.groq.com/openai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+}
+
+
+def _provider_base_url() -> "Optional[str]":
+    """Base URL for LLM_PROVIDER, matching services/verification.py. None means the OpenAI default."""
+    provider = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+    return _PROVIDER_BASE_URLS.get(provider)
+
+
 # ---------------------------------------------------------------------------
 # Pydantic Schemas
 # ---------------------------------------------------------------------------
+
+
+_VLM_PROVIDER_BASE_URLS = {
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "groq": "https://api.groq.com/openai/v1",
+}
+_VLM_PROVIDER_MODELS = {"gemini": "gemini-2.5-flash"}
+
+
+def resolve_vlm_settings(env: Mapping[str, str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (api_key, base_url, model) for the vision checks, from VLM_* variables only.
+
+    Returns (None, None, None) when no VLM_* variable is set, so the caller falls back to the
+    LLM_* settings. When VLM_PROVIDER or VLM_API_KEY is set, vision uses its own settings and
+    never borrows the text provider's key. A key sent to the wrong provider fails, and leaks.
+    """
+
+    def clean(name: str) -> Optional[str]:
+        value = (env.get(name) or "").strip()
+        return value or None
+
+    provider = (clean("VLM_PROVIDER") or "").lower() or None
+    own_key = clean("VLM_API_KEY")
+    if provider is None and own_key is None:
+        return None, None, None
+
+    base_url = clean("VLM_BASE_URL") or (_VLM_PROVIDER_BASE_URLS.get(provider) if provider else None)
+    model = clean("VLM_MODEL") or (_VLM_PROVIDER_MODELS.get(provider) if provider else None)
+    return own_key, base_url, model
 
 
 class ApprovedAssetSpec(BaseModel):
@@ -211,26 +252,46 @@ class VisionVerifier:
         timeout_seconds: float = 25.0,
         client: Optional[Any] = None,
     ) -> None:
-        self.api_key = (
-            api_key
-            or os.getenv("LLM_API_KEY")
-            or os.getenv("GROQ_API_KEY")
-            or os.getenv("GEMINI_API_KEY")
-        )
-        self.base_url = base_url or os.getenv("LLM_BASE_URL")
-        if not self.base_url and os.getenv("GROQ_API_KEY") and not os.getenv("GEMINI_API_KEY"):
-            self.base_url = "https://api.groq.com/openai/v1"
-        elif not self.base_url and os.getenv("GEMINI_API_KEY"):
-            self.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-
-        self.model = (
-            model
-            or os.getenv("VLM_MODEL")
-            or (
-                self.DEFAULT_GEMINI_MODEL
-                if (self.base_url and "googleapis" in self.base_url)
-                else self.DEFAULT_GROQ_MODEL
+        vlm_key, vlm_base_url, vlm_model = resolve_vlm_settings(os.environ)
+        if (vlm_key, vlm_base_url, vlm_model) != (None, None, None):
+            self.api_key = api_key or vlm_key
+            self.base_url = base_url or vlm_base_url
+            self.model = (
+                model
+                or vlm_model
+                or (
+                    self.DEFAULT_GEMINI_MODEL
+                    if (self.base_url and "googleapis" in self.base_url)
+                    else self.DEFAULT_GROQ_MODEL
+                )
             )
+        else:
+            self.api_key = (
+                api_key
+                or os.getenv("LLM_API_KEY")
+                or os.getenv("GROQ_API_KEY")
+                or os.getenv("GEMINI_API_KEY")
+            )
+            self.base_url = base_url or os.getenv("LLM_BASE_URL") or _provider_base_url()
+            if not self.base_url and os.getenv("GROQ_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+                self.base_url = "https://api.groq.com/openai/v1"
+            elif not self.base_url and os.getenv("GEMINI_API_KEY"):
+                self.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            self.model = (
+                model
+                or os.getenv("VLM_MODEL")
+                or (
+                    self.DEFAULT_GEMINI_MODEL
+                    if (self.base_url and "googleapis" in self.base_url)
+                    else self.DEFAULT_GROQ_MODEL
+                )
+            )
+        # Log the provider and model only. Never log the key.
+        logger.info(
+            "Vision checks: base_url=%s model=%s key_set=%s",
+            self.base_url or "default",
+            self.model,
+            bool(self.api_key),
         )
         self.timeout_seconds = timeout_seconds
         self._client = client
@@ -292,7 +353,10 @@ class VisionVerifier:
             "Check for:\n"
             "1. Outdated, stretched, cropped, low-resolution, or unauthorized logos/watermarks.\n"
             "2. Off-brand color palettes or poor foreground/background logo contrast.\n"
-            "3. Violated logo placement, safe-zone padding, or aspect-ratio rules.\n\n"
+            "3. Violated logo placement, safe-zone padding, or aspect-ratio rules.\n"
+            "4. Style adherence: photography, illustration, typography, or layout that conflicts with the visual guidelines in the Approved Asset Library (visual_rule entries).\n"
+            "5. Prohibited visual elements: anything a visual_rule entry forbids. Cite the evidence_id of the violated visual_rule entry and quote the rule in the explanation.\n"
+            "6. Misleading promotional visuals: fake badges, certifications, prize or money imagery, or claims in the artwork that no approved rule supports.\n\n"
             "Return ONLY valid JSON matching this exact schema:\n"
             "{\n"
             '  "findings": [\n'
@@ -362,6 +426,7 @@ class VisionVerifier:
         self,
         image_source: Union[str, Path, bytes],
         approved_assets: Sequence[ApprovedAssetSpec],
+        target_metadata: Optional[Any] = None,
     ) -> VisionVerificationResponse:
         """
         Offline OpenCV/Pillow fallback:
@@ -373,6 +438,15 @@ class VisionVerifier:
         target_img = _load_pil_image(image_source)
         width, height = target_img.size
         target_aspect = width / max(height, 1)
+        source_name = Path(image_source).name.casefold() if isinstance(image_source, (str, Path)) else ""
+        metadata_asset_type = (
+            target_metadata.get("asset_type")
+            if isinstance(target_metadata, dict)
+            else getattr(target_metadata, "asset_type", None)
+        )
+        compare_lockup = bool(metadata_asset_type) or any(
+            marker in source_name for marker in ("logo", "wordmark", "banner")
+        )
 
         default_asset = approved_assets[0] if approved_assets else None
         default_evidence_id = default_asset.asset_id if default_asset else "visual-quality-baseline"
@@ -398,7 +472,7 @@ class VisionVerifier:
 
         # 2. Compare against each Approved Asset reference image and palette
         for asset in approved_assets:
-            if asset.file_path and Path(asset.file_path).exists():
+            if compare_lockup and asset.file_path and Path(asset.file_path).exists():
                 try:
                     ref_img = _load_pil_image(asset.file_path)
                     ref_w, ref_h = ref_img.size
@@ -479,16 +553,20 @@ class VisionVerifier:
         image_source: Union[str, Path, bytes],
         approved_assets: Sequence[ApprovedAssetSpec],
         context_note: Optional[str] = None,
+        target_metadata: Optional[Any] = None,
     ) -> VisionVerificationResponse:
         """
         Synchronously verify a campaign image against the Approved Asset Library.
         Automatically falls back to deterministic OpenCV/Pillow checks if `LLM_API_KEY`
         is missing or if the VLM request fails / times out.
         """
+        image_assets = [a for a in approved_assets if a.file_path]
         client = self._get_client()
         if client is None:
             logger.info("LLM_API_KEY not configured; running deterministic visual fallback.")
-            return self.deterministic_fallback(image_source, approved_assets)
+            return self.deterministic_fallback(
+                image_source, image_assets, target_metadata=target_metadata
+            )
 
         try:
             target_data_url = encode_image_to_data_url(image_source)
@@ -520,4 +598,139 @@ class VisionVerifier:
                 type(exc).__name__,
                 exc,
             )
-            return self.deterministic_fallback(image_source, approved_assets)
+            return self.deterministic_fallback(image_source, image_assets)
+
+
+
+# ---------------------------------------------------------------------------
+# Module-level entry point used by app.services.orchestrator
+# ---------------------------------------------------------------------------
+
+
+def _load_approved_assets(workspace_id: str) -> List[ApprovedAssetSpec]:
+    """Read approved visual assets (KnowledgeEntry rows with entry_type='asset') for a workspace.
+
+    Expired assets and assets whose image file is missing on disk are skipped, so the
+    VLM never receives a broken or stale reference.
+    """
+    from datetime import date
+
+    from app.database import SessionLocal
+    from app.models import KnowledgeEntry, Workspace
+
+    db = SessionLocal()
+    try:
+        ws = db.get(Workspace, str(workspace_id))
+        palette = list(ws.brand_palette_hex or []) if ws else []
+        rows = (
+            db.query(KnowledgeEntry)
+            .filter(
+                KnowledgeEntry.workspace_id == str(workspace_id),
+                KnowledgeEntry.entry_type.in_(["asset", "rule"]),
+            )
+            .all()
+        )
+        today = date.today()
+        specs: List[ApprovedAssetSpec] = []
+        for row in rows:
+            if row.expiry_date is not None and row.expiry_date < today:
+                continue
+            if row.entry_type == "rule":
+                # Visual rules (e.g. "no competitor logos") go to the VLM prompt only. They have
+                # no image, so the pixel-level fallback never sees them.
+                if (row.category or "").lower() == "visual":
+                    specs.append(
+                        ApprovedAssetSpec(
+                            asset_id=row.id,
+                            name=row.title or row.id,
+                            asset_type="visual_rule",
+                            file_path=None,
+                            description=row.rule_text or "",
+                            brand_colors=[],
+                            placement_rules=None,
+                        )
+                    )
+                continue
+            if not row.image_path or not Path(row.image_path).is_file():
+                continue
+            specs.append(
+                ApprovedAssetSpec(
+                    asset_id=row.id,
+                    name=row.title or row.id,
+                    asset_type=row.asset_type or "logo",
+                    file_path=row.image_path,
+                    description=row.rule_text or row.usage_rules or "",
+                    brand_colors=palette,
+                    placement_rules=row.usage_rules or None,
+                )
+            )
+        return specs
+    finally:
+        db.close()
+
+
+def verify_images(image_units: Sequence[Any], workspace_id: str) -> List[Any]:
+    """Compare each uploaded image against the workspace's Approved Asset Library.
+
+    Returns shared-schema Finding objects (category 'visual') so the orchestrator can merge
+    them with text findings. With no approved assets, no LLM key, or any VLM failure, the
+    verifier falls back to deterministic OpenCV/Pillow checks.
+    """
+    from uuid import uuid4
+
+    from app.schemas import EvidenceItem as SharedEvidence
+    from app.schemas import Finding as SharedFinding
+
+    assets = _load_approved_assets(workspace_id)
+    if not assets:
+        return []
+
+    verifier = VisionVerifier()
+    findings: List[Any] = []
+    for unit in image_units:
+        image_path = getattr(unit.metadata, "image_path", None) or unit.content
+        if not image_path or not Path(image_path).is_file():
+            continue
+        try:
+            unit_metadata = getattr(unit, "metadata", None)
+            asset_type = (
+                unit_metadata.get("asset_type")
+                if isinstance(unit_metadata, dict)
+                else getattr(unit_metadata, "asset_type", None)
+            )
+            if asset_type:
+                response = verifier.verify(
+                    image_path, assets, target_metadata=unit_metadata
+                )
+            else:
+                response = verifier.verify(image_path, assets)
+        except Exception:  # one bad image must not break the whole analysis
+            logger.exception("Vision verification crashed for unit %s", unit.unit_id)
+            continue
+
+        # Show the uploaded file name. The image_path is a temp file and must not reach the reviewer.
+        shown_name = getattr(unit.metadata, "source_name", None) or "uploaded image"
+        label = f"[Image: {shown_name}]"
+        for vf in response.findings:
+            asset = next((a for a in assets if a.asset_id == vf.evidence_id), assets[0])
+            findings.append(
+                SharedFinding(
+                    finding_id=f"vis_{uuid4().hex[:16]}",
+                    unit_id=unit.unit_id,
+                    category="visual",
+                    severity=vf.severity,
+                    original_span=label,
+                    explanation=vf.explanation,
+                    evidence=SharedEvidence(
+                        evidence_id=asset.asset_id,
+                        source_type="guideline" if asset.asset_type == "visual_rule" else "asset",
+                        title=asset.name,
+                        content=asset.description or asset.name,
+                        owner=None,
+                        expiry_date=None,
+                    ),
+                    suggested_edit=vf.suggested_edit,
+                    confidence=vf.confidence,
+                )
+            )
+    return findings

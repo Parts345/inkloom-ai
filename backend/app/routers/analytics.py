@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 import logging
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 def _synthesize_fallback_refinement(
     rule: KnowledgeEntry,
     disputes: List[DisputeSample],
-) -> tuple[str, str]:
+) -> tuple[str, str, Optional[str]]:
     """Deterministic fallback until Ushank's dispute_refiner.py is merged."""
     reasons = [d.dispute_reason.strip() for d in disputes if d.dispute_reason.strip()]
     unique_reasons = list(dict.fromkeys(reasons))
@@ -43,13 +43,13 @@ def _synthesize_fallback_refinement(
         if unique_reasons
         else rule.rule_text
     )
-    return summary, proposed
+    return summary, proposed, None
 
 
 async def _generate_refinement_via_service(
     rule: KnowledgeEntry,
     disputes: List[DisputeSample],
-) -> tuple[str, str]:
+) -> tuple[str, str, Optional[str]]:
     """Call Ushank's dispute_refiner service if available; otherwise use fallback."""
     try:
         from app.services import dispute_refiner
@@ -72,11 +72,13 @@ async def _generate_refinement_via_service(
                 if isinstance(res, dict):
                     summary = res.get("cluster_summary") or res.get("summary") or ""
                     proposed = res.get("proposed_rule_text") or res.get("refined_rule") or ""
+                    diagnosis = res.get("diagnosis") or None
                 else:
                     summary = getattr(res, "cluster_summary", "") or getattr(res, "summary", "")
                     proposed = getattr(res, "proposed_rule_text", "") or getattr(res, "refined_rule", "")
+                    diagnosis = getattr(res, "diagnosis", None) or None
                 if summary and proposed:
-                    return str(summary), str(proposed)
+                    return str(summary), str(proposed), (str(diagnosis) if diagnosis else None)
             except Exception:
                 logger.exception("dispute_refiner.%s failed; falling back", fn_name)
             break
@@ -108,9 +110,11 @@ async def get_disputed_rules(
     )
 
     grouped: Dict[str, List[DisputeSample]] = defaultdict(list)
+    dispute_times = {}
     for finding, sub in rows:
         if not finding.evidence_id:
             continue
+        dispute_times[str(finding.id)] = sub.created_at
         grouped[finding.evidence_id].append(
             DisputeSample(
                 finding_id=str(finding.id),
@@ -129,6 +133,22 @@ async def get_disputed_rules(
         if rule is None:
             continue
 
+        # Disputes raised before the rule was last updated are already addressed.
+        applied = (
+            db.query(RuleRefinementProposal)
+            .filter_by(workspace_id=ws.id, rule_id=rule_id, status="applied")
+            .order_by(RuleRefinementProposal.id.desc())
+            .first()
+        )
+        if applied is not None and applied.applied_at is not None:
+            disputes = [
+                d for d in disputes
+                if dispute_times.get(d.finding_id) is not None
+                and dispute_times[d.finding_id] > applied.applied_at
+            ]
+            if not disputes:
+                continue
+
         proposal = (
             db.query(RuleRefinementProposal)
             .filter_by(workspace_id=ws.id, rule_id=rule_id, status="pending")
@@ -136,8 +156,13 @@ async def get_disputed_rules(
             .first()
         )
 
+        from app.services.dispute_refiner import cluster_dispute_reasons
+
+        theme_clusters = cluster_dispute_reasons([d.dispute_reason for d in disputes])
+        reason_themes = [f"{c.label} ({c.count})" for c in theme_clusters[:4]]
+
         if proposal is None or refresh or proposal.dispute_count != len(disputes):
-            summary, proposed_text = await _generate_refinement_via_service(rule, disputes)
+            summary, proposed_text, diagnosis = await _generate_refinement_via_service(rule, disputes)
             if proposal is None:
                 proposal = RuleRefinementProposal(
                     workspace_id=ws.id,
@@ -145,6 +170,7 @@ async def get_disputed_rules(
                     dispute_count=len(disputes),
                     cluster_summary=summary,
                     proposed_rule_text=proposed_text,
+                    diagnosis=diagnosis,
                     status="pending",
                 )
                 db.add(proposal)
@@ -152,6 +178,7 @@ async def get_disputed_rules(
                 proposal.dispute_count = len(disputes)
                 proposal.cluster_summary = summary
                 proposal.proposed_rule_text = proposed_text
+                proposal.diagnosis = diagnosis
             dirty = True
 
         clusters.append(
@@ -169,6 +196,8 @@ async def get_disputed_rules(
                 cluster_summary=proposal.cluster_summary,
                 proposed_rule_text=proposal.proposed_rule_text,
                 proposal_status=proposal.status,  # type: ignore[arg-type]
+                diagnosis=proposal.diagnosis,
+                reason_themes=reason_themes,
             )
         )
 
@@ -187,3 +216,50 @@ async def get_disputed_rules(
                     c.proposal_id = latest.id
 
     return clusters
+
+
+
+@router.get("")
+def get_analytics(
+    actor: Actor = Depends(resolve_actor),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Governance dashboard summary used by the Governance Analytics page.
+
+    approval_rate is approved / (approved + rejected) over decided submissions, as a fraction 0..1.
+    """
+    ws = db.get(Workspace, actor.workspace_id) or db.query(Workspace).first()
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    subs = db.query(Submission).filter_by(workspace_id=ws.id).all()
+    decided = [s for s in subs if s.status in ("approved", "rejected")]
+    approved = sum(1 for s in subs if s.status == "approved")
+    approval_rate = round(approved / len(decided), 4) if decided else 0.0
+
+    rows = (
+        db.query(FindingRecord)
+        .join(Submission, FindingRecord.submission_id == Submission.id)
+        .filter(Submission.workspace_id == ws.id)
+        .all()
+    )
+    rule_counts: Dict[str, int] = defaultdict(int)
+    category_counts: Dict[str, int] = defaultdict(int)
+    dispute_counts: Dict[str, int] = defaultdict(int)
+    for f in rows:
+        label = f.evidence_title or f.evidence_id or "Unlinked finding"
+        rule_counts[label] += 1
+        category_counts[f.category or "general"] += 1
+        if f.status == "disputed":
+            dispute_counts[label] += 1
+
+    def _top(counts: Dict[str, int], limit: int) -> list:
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+    return {
+        "total_submissions": len(subs),
+        "approval_rate": approval_rate,
+        "top_rules": [{"rule": k, "count": v} for k, v in _top(rule_counts, 5)],
+        "by_category": [{"category": k, "count": v} for k, v in _top(category_counts, 10)],
+        "disputed_rules": [{"rule": k, "disputes": v} for k, v in _top(dispute_counts, 10)],
+    }

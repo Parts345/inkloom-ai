@@ -91,15 +91,14 @@ def _shared(finding_id: str, category: str, severity: str, span: str = "100% upt
     )
 
 
-def test_same_span_across_categories_keeps_most_severe():
+def test_same_span_across_unrelated_categories_stays_separate():
     fact = _shared("f1", "fact", "critical")
     terminology = _shared("f2", "terminology", "major")
 
     merged = merge_findings([terminology, fact])
 
-    assert len(merged) == 1
-    assert merged[0].severity == "critical"
-    assert merged[0].category == "fact"
+    assert len(merged) == 2
+    assert {finding.category for finding in merged} == {"fact", "terminology"}
 
 
 def test_different_overlapping_spans_are_both_kept():

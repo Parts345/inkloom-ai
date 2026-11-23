@@ -2,7 +2,10 @@
 **/dist
 **/__pycache__
 **/*.pyc
+**/.pytest_cache
 .git
 *.db
+*.log
+**/*.log
 .env
 .env.*

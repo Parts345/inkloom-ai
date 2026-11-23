@@ -5,14 +5,38 @@ export interface Evidence { title: string; quote: string; owner: string; expires
 export interface Finding {
   id: string; category: 'Brand' | 'Fact' | 'Accessibility' | 'Legal' | string; severity: Severity; confidence: number;
   explanation: string; original: string; suggested: string;
+  /** The backend's suggested fix as written. Shown even when it cannot be applied inline. */
+  fix?: string;
+  /** True only for a text finding whose span is still in the draft. Only these can be accepted inline. */
+  editable?: boolean;
   status: 'open' | 'accepted' | 'rejected' | 'disputed'; dispute_reason?: string; evidence: Evidence;
 }
 export interface AuditEvent { at: string; actor: string; role?: string; action: string; detail?: string }
 export interface Submission {
   id: string; title: string; content: string; version: number; status: Status;
   findings?: Finding[]; audit?: AuditEvent[]; updated_at?: string;
+  llm_verification_failed?: boolean;
 }
 export interface KbItem { id: string; kind: 'guideline' | 'fact' | 'term'; title: string; body: string; owner?: string; expires_at?: string | null; expired?: boolean; preferred?: string; banned?: string }
+export interface DisputeSample { finding_id: string; submission_id: string; submission_title: string; original_span: string; dispute_reason: string }
+export interface DisputedRuleCluster {
+  rule_id: string; rule_title: string; entry_type: string; category?: string | null; severity: Severity;
+  current_rule_text: string; rule_version: number; dispute_count: number; disputes: DisputeSample[];
+  proposal_id?: number | null; cluster_summary: string; proposed_rule_text: string;
+  proposal_status: 'pending' | 'applied' | 'dismissed';
+  /** LLM or heuristic root-cause diagnosis of the rule's friction */
+  diagnosis?: string | null;
+  /** Creator dispute reasons grouped into themes, e.g. "quote, context (3)" */
+  reason_themes?: string[];
+}
+export interface ApprovedAsset { id: string; title: string; asset_type: string; usage_rules: string; image_url: string; owner?: string | null; version: number }
+export interface ApplyRefinementResult { rule_id: string; title: string; old_rule_text: string; new_rule_text: string; new_version: number; proposal_id?: number | null; reindexed: boolean }
+/** Number of OCR-read units, from the extraction audit event (e.g. "units=5 ocr_units=3 image_units=0"). */
+export const ocrUnitCount = (audit?: AuditEvent[]): number => {
+  const event = [...(audit ?? [])].reverse().find(a => a.action === 'extraction_completed');
+  const match = event?.detail?.match(/ocr_units=(\d+)/);
+  return match ? Number(match[1]) : 0;
+};
 export interface Analytics {
   total_submissions: number; approval_rate: number;
   top_rules: { rule: string; count: number }[]; by_category: { category: string; count: number }[];
@@ -51,6 +75,7 @@ interface ApiFinding {
   original?: string;
   suggested_edit?: string | null;
   suggested?: string;
+  editable?: boolean;
   category: Finding['category'];
   severity: Severity;
   confidence: number;
@@ -91,6 +116,7 @@ interface ApiSubmission {
   audit?: ApiAuditEvent[];
   created_at?: string;
   updated_at?: string;
+  llm_verification_failed?: boolean;
 }
 
 interface ApiKnowledge {
@@ -115,10 +141,10 @@ function mapStatus(status: string): Status {
 
 function mapFinding(raw: ApiFinding, currentText: string): Finding {
   const original = raw.original_span ?? raw.original ?? '';
-  const proposed = raw.suggested_edit ?? raw.suggested ?? '';
-  const suggested = typeof proposed === 'string' && proposed.trim() && original && currentText.includes(original)
-    ? proposed
-    : '';
+  const proposed = typeof (raw.suggested_edit ?? raw.suggested) === 'string' ? (raw.suggested_edit ?? raw.suggested ?? '') : '';
+  // The server decides editability (text finding, span still in the draft). Fall back to the same rule if absent.
+  const editable = raw.editable ?? (raw.category !== 'visual' && !!original && currentText.includes(original));
+  const suggested = editable && proposed.trim() ? proposed : '';
   const evidence = raw.evidence ?? {};
   return {
     id: raw.finding_id ?? raw.id ?? '',
@@ -128,6 +154,8 @@ function mapFinding(raw: ApiFinding, currentText: string): Finding {
     explanation: raw.explanation,
     original,
     suggested,
+    fix: proposed.trim(),
+    editable,
     status: raw.status,
     dispute_reason: raw.dispute_reason,
     evidence: {
@@ -157,6 +185,7 @@ function mapSubmission(raw: ApiSubmission): Submission {
       detail: event.detail,
     })),
     updated_at: raw.created_at ?? raw.updated_at,
+    llm_verification_failed: raw.llm_verification_failed ?? (raw.audit_log ?? raw.audit ?? []).some(event => event.action === 'llm_verification_failed'),
   };
 }
 
@@ -227,6 +256,11 @@ export const api = {
     return mapKnowledge(created[0]);
   },
   analytics: () => req<Analytics>('/analytics'),
+  disputedRules: async (): Promise<DisputedRuleCluster[]> => (USE_MOCK ? [] : req<DisputedRuleCluster[]>('/analytics/disputed-rules')),
+  listAssets: async (): Promise<ApprovedAsset[]> => (USE_MOCK ? [] : req<ApprovedAsset[]>('/knowledge/assets')),
+  uploadAsset: (form: FormData) => req<ApprovedAsset>('/knowledge/assets/upload', { method: 'POST', body: form }),
+  applyRefinement: (ruleId: string, proposedRuleText?: string) =>
+    req<ApplyRefinementResult>(`/knowledge/rules/${ruleId}/apply-refinement`, { method: 'POST', body: body({ proposed_rule_text: proposedRuleText ?? null }) }),
 };
 
 export const SAMPLE_DRAFT = `Introducing NovaTech Cloud Pro — the world's #1 cloud platform, with 100% uptime guaranteed and zero security risk.

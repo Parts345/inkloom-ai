@@ -25,10 +25,16 @@ RUN useradd --create-home --uid 1000 app \
  && mkdir -p /data \
  && chown app:app /data
 
-COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
- && pip install -r backend/requirements.txt
+# Tesseract powers scanned-PDF OCR (services/extraction.py). Installed from apt so it works offline.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng libgl1 \
+ && rm -rf /var/lib/apt/lists/*
 
+COPY backend/requirements.txt ./backend/requirements.txt
+RUN pip install --timeout 120 --retries 10 torch --index-url https://download.pytorch.org/whl/cpu \
+ && pip install --timeout 120 --retries 10 -r backend/requirements.txt \
+ && python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('rapidocr ok')"
+ 
 # Bake the embedding model into the image so the first analysis never waits on the Hugging Face Hub.
 RUN mkdir -p /home/app/.cache/huggingface \
  && HF_HOME=/home/app/.cache/huggingface python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2', device='cpu')" \

@@ -69,6 +69,8 @@ class RuleRefinementProposal(Base):
     dispute_count = Column(Integer, nullable=False, default=0)
     cluster_summary = Column(Text, nullable=False)
     proposed_rule_text = Column(Text, nullable=False)
+    # ambiguous | overly_broad | outdated | well_calibrated (nullable: proposals made before this column existed)
+    diagnosis = Column(String(30), nullable=True)
     status = Column(String(20), nullable=False, default="pending")  # pending | applied | dismissed
     created_at = Column(DateTime, nullable=False, default=utcnow)
     applied_at = Column(DateTime, nullable=True)

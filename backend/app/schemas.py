@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 UnitType = Literal["text", "image"]
 SourceType = Literal["guideline", "fact", "term", "asset"]
 AssetType = Literal["logo", "banner", "palette"]
-FindingCategory = Literal["fact", "tone", "terminology", "visual", "accessibility"]
+FindingCategory = Literal["fact", "tone", "terminology", "visual", "accessibility", "brand"]
 Severity = Literal["critical", "major", "minor"]
 FindingStatus = Literal["open", "accepted", "rejected", "disputed"]
 SubmissionStatus = Literal["draft", "in_review", "revision_required", "approved", "rejected"]
@@ -38,6 +38,10 @@ class UnitMetadata(BaseModel):
     # Round 3 Imp. 2: Image path / MIME metadata for VLM verification
     image_path: Optional[str] = None
     mime_type: Optional[str] = None
+    # Original upload name (e.g. "ad.png"). image_path is a temp file and must never be shown.
+    source_name: Optional[str] = None
+    # True for images found inside a PDF or DOCX (not uploaded on their own)
+    embedded: bool = False
 
 
 class ContentUnit(BaseModel):
@@ -80,6 +84,9 @@ class Finding(BaseModel):
     dispute_reason: Optional[str] = None
     # Round 3 Imp. 2: Optional VLM visual notes
     visual_notes: Optional[str] = None
+    # True when original_span is plain text in the draft and the finding is not a visual one.
+    # Only editable findings can be accepted as an inline text edit.
+    editable: bool = False
 
     @model_validator(mode="after")
     def _dispute_requires_reason(self) -> "Finding":
@@ -105,6 +112,7 @@ class SubmissionResponse(BaseModel):
     current_text: str
     findings: List[Finding] = Field(default_factory=list)
     audit_log: List[AuditEvent] = Field(default_factory=list)
+    llm_verification_failed: bool = False
 
 
 # --------------------------------------------------------------------------- Round 3 Schemas
@@ -143,6 +151,9 @@ class DisputedRuleCluster(BaseModel):
     cluster_summary: str
     proposed_rule_text: str
     proposal_status: ProposalStatus = "pending"
+    diagnosis: Optional[str] = None
+    # Creator dispute reasons grouped into themes, e.g. "quote, context (3)"
+    reason_themes: List[str] = Field(default_factory=list)
 
 
 class ApplyRefinementIn(BaseModel):

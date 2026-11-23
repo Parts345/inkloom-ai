@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -315,12 +316,15 @@ RULES:
 3. MINIMAL EDITS:
    - `original_span` must be an exact verbatim substring of `content_unit.text`.
    - `suggested_edit` must be a minimal drop-in replacement for `original_span` preserving the author's meaning and voice.
+   - Keep the original capitalisation of the span.
+   - Do not replace a claim with a shorter claim that keeps the same offer (for example, "Get Free Coke on every order" must not become "Order now").
+   - If the only fix removes the offer, return an empty suggested_edit and say in the explanation that the author must rewrite the sentence.
 4. Explanations must be written for a human reviewer. Do not mention "fact entry", "register", "evidence_id" or other internal terms. Say what is wrong and what the approved value is.
-5. suggested_edit must not contain any banned term, and must not repeat the original text unchanged. If the correct action is removal, set suggested_edit to an empty string.
+5. suggested_edit must not contain any banned term, and must not repeat the original text unchanged. If the correct action is removal and the sentence would still read correctly without the span, set suggested_edit to an empty string. If removing the span would break the sentence, do not return a removal: set suggested_edit to the smallest rewrite that keeps the sentence grammatical without adding a new claim, or to an empty string and say in explanation that the author must rewrite the sentence.
 6. Prefer approved facts over invented wording. For example use "99.95% monthly uptime SLA" rather than "guaranteed" or "100% uptime".
 7. suggested_edit must be plain text that can replace original_span inside a sentence. Do not add markup, URLs, file names, or new factual claims. For an image placeholder, suggest a short plain-text description such as "[Image: NovaTech team photo]". For a superlative or unsupported claim, suggest removing the claim or rewording it without adding a new claim.
-8. Flag exclamation marks in customer-facing copy as tone issues under the brand voice guideline. Do not flag them in headings.
-9. For punctuation issues such as exclamation marks, original_span must include the two or three words before the mark, for example "zero downtime!", and suggested_edit must be the same words without the mark. Never return a bare punctuation mark as original_span or suggested_edit. For passive voice, rewrite the sentence in active voice without dropping the subject. For example, "keeps your data encrypted by us" becomes "we encrypt your data".
+8. Flag exclamation marks in customer-facing copy as one tone finding per ContentUnit. The finding's original_span must be the first full source line containing an exclamation mark, and its explanation must state how many lines contain exclamation marks. Do not emit separate findings for each line.
+9. Before checking punctuation, normalize text with Unicode NFKC so full-width punctuation is recognized. Keep original_span as an exact substring of the unnormalized source. For passive voice, rewrite the sentence in active voice without dropping the subject. For example, "keeps your data encrypted by us" becomes "we encrypt your data".
 10. Return ONLY valid JSON matching:
    {"findings": [{"category": "...", "fact_status": "...", "severity": "...", "original_span": "...", "evidence_id": null, "evidence_quote": null, "explanation": "...", "suggested_edit": "...", "confidence": 0.0}]}
 """
@@ -416,6 +420,64 @@ def _terminology_explanation(span: str, ev: EvidenceItem, suggested: str) -> str
     if not suggested:
         text += " Remove the banned term."
     return text
+
+
+def _exclamation_tone_finding(
+    unit: ContentUnit, evidence_pool: List[EvidenceItem]
+) -> Optional[Finding]:
+    source_lines = unit.text.splitlines()
+    check_lines = unicodedata.normalize("NFKC", unit.text).splitlines()
+    flagged_lines = [
+        source_line
+        for source_line, check_line in zip(source_lines, check_lines)
+        if "!" in check_line
+    ]
+    if not flagged_lines:
+        return None
+
+    guideline = next(
+        (
+            item for item in evidence_pool
+            if item.entry_type == EntryType.GUIDELINE and item.category.casefold() == "tone"
+        ),
+        None,
+    )
+    original_span = flagged_lines[0].strip()
+    line_count = len(flagged_lines)
+    line_word = "line" if line_count == 1 else "lines"
+    explanation = (
+        f"Exclamation marks appear on {line_count} {line_word}, which can make the copy "
+        "feel overly emphatic and conflict with the brand voice."
+    )
+    return Finding(
+        category=IssueCategory.TONE,
+        fact_status=FactVerificationStatus.NOT_APPLICABLE,
+        severity=guideline.severity if guideline else Severity.MINOR,
+        original_span=original_span,
+        evidence_id=guideline.evidence_id if guideline else None,
+        evidence_quote=guideline.quote if guideline else None,
+        explanation=explanation,
+        suggested_edit=re.sub(r"[!！]+", "", original_span).strip(),
+        confidence=0.95,
+    )
+
+
+def _collapse_exclamation_tone_findings(
+    findings: List[Finding], unit: ContentUnit, evidence_pool: List[EvidenceItem]
+) -> List[Finding]:
+    aggregate = _exclamation_tone_finding(unit, evidence_pool)
+    if aggregate is None:
+        return findings
+
+    retained = [
+        finding for finding in findings
+        if not (
+            finding.category == IssueCategory.TONE
+            and "!" in unicodedata.normalize("NFKC", finding.original_span)
+        )
+    ]
+    retained.append(aggregate)
+    return retained
 
 
 def _deterministic_mock_analyze(
@@ -527,6 +589,9 @@ def _deterministic_mock_analyze(
             )
         )
 
+    tone_finding = _exclamation_tone_finding(unit, evidence_pool)
+    if tone_finding is not None:
+        findings.append(tone_finding)
     return findings
 
 
@@ -711,12 +776,27 @@ def _llm_analyze(
     raise RuntimeError(f"Schema validation failed after {max_retries + 1} attempts: {last_err}")
 
 
+class ClaimChecksUnavailable(Exception):
+    """The LLM claim check failed for one or more units, so the rule-based fallback ran instead.
+
+    `partial_findings` holds every finding produced, so the review still shows them. The
+    orchestrator uses this to set llm_verification_failed and show the "claim checks did not run"
+    notice, instead of silently showing only the rule-based results.
+    """
+
+    def __init__(self, partial_findings, failed_unit_ids):
+        super().__init__(f"LLM claim checks failed for {len(failed_unit_ids)} unit(s)")
+        self.partial_findings = partial_findings
+        self.failed_unit_ids = failed_unit_ids
+
+
 def analyze_text_unit(
     unit: ContentUnit,
     retrieved_evidence: List[EvidenceItem],
     evidence_pool: Optional[List[EvidenceItem]] = None,
     max_retries: int = 2,
     temperature: float = 0.1,
+    failures: Optional[List[str]] = None,
 ) -> List[Finding]:
     """Analyze one ContentUnit.
 
@@ -744,6 +824,8 @@ def analyze_text_unit(
             unit.unit_id,
             err,
         )
+        if failures is not None:
+            failures.append(str(unit.unit_id))
         return _deterministic_mock_analyze(unit, pool)
 
     # Keep exact-match checks that the LLM missed, but avoid duplicating a
@@ -757,7 +839,7 @@ def analyze_text_unit(
             for llm_finding in llm_findings
         )
     ]
-    return llm_findings + extra
+    return _collapse_exclamation_tone_findings(llm_findings + extra, unit, pool)
 
 
 
@@ -863,6 +945,28 @@ def _to_shared_finding(
     )
 
 
+def _batch_units(
+    units: List[shared_schemas.ContentUnit],
+    max_units: int = 20,
+    max_chars: int = 6000,
+) -> List[List[shared_schemas.ContentUnit]]:
+    batches: List[List[shared_schemas.ContentUnit]] = []
+    current_batch: List[shared_schemas.ContentUnit] = []
+    current_chars = 0
+    for u in units:
+        u_len = len(u.content or "")
+        if current_batch and (len(current_batch) >= max_units or current_chars + u_len > max_chars):
+            batches.append(current_batch)
+            current_batch = [u]
+            current_chars = u_len
+        else:
+            current_batch.append(u)
+            current_chars += u_len
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
 async def verify_units(
     units: List[shared_schemas.ContentUnit], workspace_id: str
 ) -> List[shared_schemas.Finding]:
@@ -887,42 +991,48 @@ async def verify_units(
         # Every active entry in the workspace, for lexical checks that don't depend on embeddings.
         lexical_all = [_entry_to_evidence(e, today) for e in rag_engine.get_entries(ws)]
 
+        batches = _batch_units(units, max_units=20, max_chars=6000)
         all_findings: List[shared_schemas.Finding] = []
-        for unit in units:
-            if unit.unit_type != "text" or not (unit.content or "").strip():
-                continue
+        failures: List[str] = []
+        for batch in batches:
+            for unit in batch:
+                if unit.unit_type != "text" or not (unit.content or "").strip():
+                    continue
 
-            try:
-                retrieved = rag_engine.retrieve_evidence(
-                    query_text=unit.content,
+                try:
+                    retrieved = rag_engine.retrieve_evidence(
+                        query_text=unit.content,
+                        workspace_id=ws,
+                        top_k=6,
+                        min_similarity=0.15,
+                        reference_date=today,
+                    )
+                except Exception:
+                    logger.exception("Retrieval failed for unit %s; using lexical pool only", unit.unit_id)
+                    retrieved = []
+
+                pool_map: Dict[str, EvidenceItem] = {ev.evidence_id: ev for ev in lexical_all}
+                pool_map.update({ev.evidence_id: ev for ev in retrieved})
+                ev_lookup = {
+                    eid: (ev, owner_map.get(eid)) for eid, ev in pool_map.items()
+                }
+
+                local_unit = ContentUnit(
+                    unit_id=str(unit.unit_id),
                     workspace_id=ws,
-                    top_k=6,
-                    min_similarity=0.15,
-                    reference_date=today,
+                    text=unit.content,
                 )
-            except Exception:
-                logger.exception("Retrieval failed for unit %s; using lexical pool only", unit.unit_id)
-                retrieved = []
+                local_findings = analyze_text_unit(
+                    local_unit,
+                    retrieved,
+                    evidence_pool=list(pool_map.values()),
+                    failures=failures,
+                )
+                for lf in local_findings:
+                    all_findings.append(_to_shared_finding(lf, unit.unit_id, ev_lookup))
 
-            pool_map: Dict[str, EvidenceItem] = {ev.evidence_id: ev for ev in lexical_all}
-            pool_map.update({ev.evidence_id: ev for ev in retrieved})
-            ev_lookup = {
-                eid: (ev, owner_map.get(eid)) for eid, ev in pool_map.items()
-            }
-
-            local_unit = ContentUnit(
-                unit_id=str(unit.unit_id),
-                workspace_id=ws,
-                text=unit.content,
-            )
-            local_findings = analyze_text_unit(
-                local_unit,
-                retrieved,
-                evidence_pool=list(pool_map.values()),
-            )
-            for lf in local_findings:
-                all_findings.append(_to_shared_finding(lf, unit.unit_id, ev_lookup))
-
+        if failures:
+            raise ClaimChecksUnavailable(all_findings, sorted(set(failures)))
         return all_findings
 
     return await asyncio.to_thread(_run_sync)
