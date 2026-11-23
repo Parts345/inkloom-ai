@@ -241,7 +241,7 @@ class VisionVerifier:
     Multimodal Brand & Visual Asset Verifier.
     """
 
-    DEFAULT_GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+    DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
     DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
     def __init__(

@@ -87,13 +87,13 @@ def test_vlm_structured_json_response(
 
     verifier = VisionVerifier(
         api_key="test-key",
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        model="qwen/qwen3.8-27b",
         client=mock_client,
     )
     result = verifier.verify(target_img, sample_assets, context_note="Q4 Cloud Launch Hero")
 
     assert result.used_fallback is False
-    assert result.model_used == "meta-llama/llama-4-scout-17b-16e-instruct"
+    assert result.model_used == "qwen/qwen3.8-27b"
     assert len(result.findings) == 1
 
     finding = result.findings[0]
