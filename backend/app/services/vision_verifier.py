@@ -576,13 +576,31 @@ class VisionVerifier:
                 context_note=context_note,
             )
 
-            completion = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                timeout=self.timeout_seconds,
-            )
+            try:
+                completion = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=600,
+                    response_format={"type": "json_object"},
+                    timeout=self.timeout_seconds,
+                )
+            except Exception as req_exc:
+                err_text = str(req_exc)
+                if "json_validate_failed" not in err_text and "response_format" not in err_text:
+                    raise
+                logger.warning(
+                    "VLM JSON response_format rejected by %s (%s); retrying without response_format",
+                    self.model,
+                    req_exc,
+                )
+                completion = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=600,
+                    timeout=self.timeout_seconds,
+                )
             raw_content = completion.choices[0].message.content or '{"findings": []}'
             valid_ids = {a.asset_id for a in approved_assets}
             findings = self._parse_vlm_json(raw_content, valid_ids)
