@@ -333,7 +333,7 @@ RULES:
 class LLMProviderClient:
     DEFAULT_CONFIGS: Dict[str, Dict[str, Optional[str]]] = {
         "openai": {"base_url": None, "model": "gpt-4o-mini"},
-        "groq": {"base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile"},
+        "groq": {"base_url": "https://api.groq.com/openai/v1", "model": "openai/gpt-oss-20b"},
         "gemini": {
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
             "model": "gemini-2.5-flash",
