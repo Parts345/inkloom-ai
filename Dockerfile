@@ -17,7 +17,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DEMO_MODE=true \
     FRONTEND_DIST=/app/frontend/dist \
     DATABASE_URL=sqlite:////data/inkloom.db \
-    HF_HOME=/home/app/.cache/huggingface
+    HF_HOME=/home/app/.cache/huggingface \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MALLOC_ARENA_MAX=2 \
+    TOKENIZERS_PARALLELISM=false
 
 WORKDIR /app
 

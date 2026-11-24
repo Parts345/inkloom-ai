@@ -22,6 +22,11 @@ CORS_ORIGINS = [
 async def lifespan(_: FastAPI):
     init_db()
     seed_demo_workspace()  # Idempotent: seeds NovaTech Cloud workspace, assets, and disputes.
+    try:
+        from app.services.verification import _ensure_index_loaded
+        _ensure_index_loaded("ws-novatech")
+    except Exception:
+        pass
     yield
 
 
